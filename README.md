@@ -312,7 +312,7 @@ python -m pytest tests/ -v
 | `AGENTS_GROUP_ID` | Yes | Telegram group ID where the bot operates (prefix channels with `-100`) |
 | `ALLOWED_GROUPS` | No | JSON array of additional group IDs: `'[-100123456789]'` |
 | `OPERATOR_IDS` | No | JSON array of Telegram user IDs: `'[12345678]'` |
-| `AGENT_DIR` | No | Agent directory for operator Bash tool restrictions (default: `~/server/ln-agent`) |
+| `AGENT_DIR` | No | Agent directory for operator Bash tool restrictions (default: script directory) |
 | `PROVIDER_ORDER` | No | Comma-separated provider priority (default: `claude,codex,opencode`) |
 | `OPENCODE_MODEL` | No | OpenCode model to enable it (e.g. `anthropic/claude-sonnet-4-5`) |
 
