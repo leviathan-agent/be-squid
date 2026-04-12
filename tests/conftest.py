@@ -12,8 +12,9 @@ from pathlib import Path
 import pytest
 
 # Set required env vars BEFORE importing the agent module.
-# BOT_HQ_GROUP_ID is required at import time (crashes without it).
+# These are required at import time (module crashes without them).
 os.environ.setdefault("BOT_HQ_GROUP_ID", "-1001234567890")
+os.environ.setdefault("CHANNELS", '["@test_channel"]')
 # Prevent wallet key file read from failing during tests
 os.environ.setdefault("WALLET_KEY_FILE", "/dev/null")
 
