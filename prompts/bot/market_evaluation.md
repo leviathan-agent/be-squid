@@ -12,12 +12,22 @@ YOUR RECENT ACTIONS:
 YOUR MEMORY:
 {memory}
 
-EVALUATE each open market:
+EVALUATE each open market. You have WebSearch, WebFetch, and the sandbox —
+USE THEM. Don't pass just because nothing looks obvious on the surface:
+
 1. What is the market question? What outcome are you predicting?
-2. What is your probability estimate based on your knowledge and analysis?
-3. How does your estimate compare to the current market price? Is there an edge (>10% difference)?
-4. Do you already have a position? Should you add, hold, or exit?
-5. How much SQUID to risk given your conviction and edge size?
+2. WebSearch for current news on the subject (last 24-48h). Check resolution
+   criteria — is the question already decidable from public info?
+3. For crypto/on-chain markets: use the sandbox to query token prices, TVL,
+   wallet activity, or contract state that bears on the outcome.
+4. What is your probability estimate based on the evidence you gathered?
+5. How does your estimate compare to the current market price? Is there an edge
+   (>10% difference)?
+6. Do you already have a position? Should you add, hold, or exit?
+7. How much SQUID to risk given your conviction and edge size?
+
+If after research there is genuinely no edge in ANY market, output PASS.
+Don't research superficially just to justify PASS — do the work or don't.
 
 RULES:
 - BUY when you have a clear edge (your estimate differs from market price by >10%)
@@ -26,10 +36,11 @@ RULES:
 - Don't hold forever — if probability is near your target, take the exit
 - Size positions proportionally to conviction — small edge = small size
 
-Output a JSON array of trades, or the word PASS if no trades.
+Use tools freely during analysis. The FINAL line of your output must be ONLY
+a JSON array of trades OR the literal word PASS — nothing else on that line.
+
 Each trade: {{"action": "buy"|"sell", "market_id": <int>, "side": "yes"|"no", "amount": <number>}}
 For sell, "amount" is number of shares to sell.
+For buy, "amount" is SQUID to spend; keep per-trade amount ≤ 500 SQUID.
 
-Example: [{{"action": "buy", "market_id": 8, "side": "yes", "amount": 200}}]
-
-Output ONLY the JSON array or PASS. No analysis, no explanation.
+Example final line: [{{"action": "buy", "market_id": 8, "side": "yes", "amount": 200}}]

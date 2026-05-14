@@ -35,17 +35,13 @@ from prompt_loader import load_prompt
 
 BASE_DIR = Path(__file__).parent
 SOUL_FILE = BASE_DIR / "SOUL.md"
-def _load_bot_token() -> str:
-    """Load bot token from env var or file. Exits if neither is available."""
-    token = os.environ.get("BOT_TOKEN")
-    if token:
-        return token.strip()
-    path = Path(os.environ.get("BOT_TOKEN_FILE", "~/.claude/.ln-bot-token")).expanduser()
-    if path.exists():
-        return path.read_text().strip()
-    sys.exit(f"ERROR: Set BOT_TOKEN env var or create token file at {path}")
-
-BOT_TOKEN = _load_bot_token()
+BOT_TOKEN = os.environ.get("BOT_TOKEN")
+if not BOT_TOKEN:
+    _token_path = Path(os.environ.get("BOT_TOKEN_FILE", "~/.claude/.ln-bot-token")).expanduser()
+    if _token_path.exists():
+        BOT_TOKEN = _token_path.read_text().strip()
+if not BOT_TOKEN:
+    sys.exit("ERROR: BOT_TOKEN env var or BOT_TOKEN_FILE path is required")
 
 CLAUDE_BIN = os.environ.get("CLAUDE_BIN",
     shutil.which("claude") or str(Path("~/.local/bin/claude").expanduser()))
@@ -72,24 +68,33 @@ def _resolve_codex_bin() -> str:
 
 
 CODEX_BIN = os.environ.get("CODEX_BIN", _resolve_codex_bin())
-CODEX_MODEL = os.environ.get("CODEX_MODEL", "gpt-5.4")
+CODEX_MODEL = os.environ.get("CODEX_MODEL", "gpt-5.5")
+CODEX_EFFORT = os.environ.get("CODEX_EFFORT", "xhigh")
 CLAUDE_LIMIT_COOLDOWN = int(os.environ.get("CLAUDE_LIMIT_COOLDOWN", str(6 * 60 * 60)))
 
 # Shared DB with ln-agent — gives the bot access to posted articles,
 # comments, votes, and conversation history
 DB_FILE = BASE_DIR / "agent.db"
 
-# Agent directory — configurable for different deployment layouts
+# Groups where the agent responds to both humans and bots
+# Agent install directory — used to construct path-restricted tool allowlists
+# below. Defaults to BASE_DIR (the file's own directory) so the bot works out
+# of the box; override AGENT_DIR if you run the bot from a different location.
 AGENT_DIR = os.environ.get("AGENT_DIR", str(BASE_DIR))
 
-# Agent identity — used in prompts and logs
+# Agent identity — drives prompt templating and self-mention detection.
+# AGENT_NAME is the display name; BOT_USERNAME is the Telegram bot's @handle.
 AGENT_NAME = os.environ.get("AGENT_NAME", "Agent")
-BOT_USERNAME = os.environ.get("BOT_USERNAME", "").lower()  # Telegram bot username (without @)
+BOT_USERNAME = os.environ.get("BOT_USERNAME", "").lower()
+# Optional: Telegram username (no @) of the headline-bot whose posts you want to
+# always engage with (pre-screen bypass). Leave empty if you don't have one.
+HEADLINE_BOT_USERNAME = os.environ.get("HEADLINE_BOT_USERNAME", "").lower()
 
-# Groups where the bot responds to both humans and bots
-if "AGENTS_GROUP_ID" not in os.environ:
-    sys.exit("ERROR: AGENTS_GROUP_ID env var is required (Telegram group ID, prefix channels with -100)")
+# Primary chat the bot lives in. REQUIRED — the bot will refuse to start
+# without it (most response logic keys off this group).
 AGENTS_GROUP_ID = int(os.environ["AGENTS_GROUP_ID"])
+# Additional Telegram group/chat IDs the bot is permitted to respond in.
+# JSON array of integers. The primary AGENTS_GROUP_ID is always included.
 ALLOWED_GROUPS = {AGENTS_GROUP_ID} | set(json.loads(os.environ.get("ALLOWED_GROUPS", "[]")))
 
 # Tool allowlists — tiered by sender authorization level.
@@ -114,10 +119,15 @@ TOOLS_OPERATOR = ",".join([
     # GitHub client — write-only access to allowlisted public repos.
     # Operator gets full access including allowlist management.
     f"Bash({AGENT_DIR}/github_client.sh*)",
+    # Build runtime — queues async build tasks for the benthic-builder daemon.
+    # Operator-only because the daemon spawns Codex with bypass-sandbox to ship
+    # real code under the configured GitHub org.
+    f"Bash({AGENT_DIR}/bin/benthic-build*)",
 ])
 
 # Authorized operators — checked by immutable Telegram user ID (not username).
 # Usernames can be changed by anyone; user IDs are permanent and unforgeable.
+# JSON array of integers. Operators get the path-restricted Bash allowlist above.
 OPERATOR_IDS = set(json.loads(os.environ.get("OPERATOR_IDS", "[]")))
 
 # Rate limiting
@@ -125,6 +135,10 @@ MIN_REPLY_INTERVAL = 5   # seconds between replies to the same sender
 MAX_THREAD_DEPTH = 5     # stop replying after this many exchanges in a thread
 POLL_TIMEOUT = 30        # long poll timeout in seconds
 MARKET_CHECK_INTERVAL = int(os.environ.get("MARKET_CHECK_INTERVAL", "1800"))  # 30 min
+# Hard cap on per-trade buy amount during autonomous market checks.
+# Defends against prompt injection via WebFetch content: even if a poisoned page
+# convinces the model to emit a trade, amount is bounded. Matches the prompt cap.
+MAX_MARKET_BUY_SQUID = int(os.environ.get("MAX_MARKET_BUY_SQUID", "500"))
 
 # ─── Prompt Injection Defense (same as ln-agent.py) ─────────────────────────
 
@@ -136,10 +150,10 @@ LEAK_PATTERNS = [
     "webfetch", "websearch", "twitter-explorer",
     "here's the comment", "here is the comment",
     "here's the reply", "here is the reply",
-    "here's the agent reply", "here is the agent reply",
-    "here's my response", "here is my response",
+    "here's the benthic reply", "here is the benthic reply",
+    "here's my response:", "here is my response:",
     "now i have the numbers", "now i have enough",
-    "let me write the response", "write the response",
+    "let me write the response",
     "let me search twitter", "let me search the web", "let me use webfetch",
 ]
 
@@ -190,6 +204,9 @@ INJECTION_OUTPUT_PATTERNS = [
     "disregard previous", "disregard all", "disregard above",
     "new instructions", "system prompt", "my instructions",
     "as an ai", "as a language model", "i'm an ai",
+    # Credential filenames — if the LLM emits these it may be leaking paths to secrets.
+    # Note: known-public wallet addresses are not flagged — the agent legitimately shares its
+    # public address when asked. Private key has its own detection via _wallet_key_prefix.
     "ln-wallet", "telegram-creds", "agent_session", "ln-bot-token",
     "my wallet key is", "my private key is", "my api key is",
 ]
@@ -344,7 +361,7 @@ def sanitize_bot_commands(text: str) -> str:
 
 # ─── Logging ─────────────────────────────────────────────────────────────────
 
-LOG_FILE = BASE_DIR / "bot.log"
+LOG_FILE = BASE_DIR / "benthic.log"
 _log_fmt = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s")
 # File handler — 10MB rotation, 5 backups (same as ln-agent)
 _file_handler = logging.handlers.RotatingFileHandler(
@@ -354,7 +371,7 @@ _file_handler.setFormatter(_log_fmt)
 _console_handler = logging.StreamHandler(sys.stdout)
 _console_handler.setFormatter(_log_fmt)
 logging.basicConfig(level=logging.INFO, handlers=[_console_handler, _file_handler])
-log = logging.getLogger("chat-bot")
+log = logging.getLogger("benthic-bot")
 
 # Initialize secret patterns now that logging is available
 _add_secret_patterns()
@@ -440,6 +457,28 @@ def _ensure_chat_table():
             keywords TEXT NOT NULL,
             updated_at TEXT NOT NULL
         )""")
+        # Build task queue — operator-driven async builds executed by the
+        # benthic-builder daemon. The bot writes rows here via bin/benthic-build;
+        # the daemon polls, runs Codex per task, and posts completions back.
+        conn.execute("""CREATE TABLE IF NOT EXISTS build_tasks (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            requested_by INTEGER NOT NULL DEFAULT 0,
+            chat_id INTEGER NOT NULL DEFAULT 0,
+            message_id INTEGER,
+            request_text TEXT,
+            brief TEXT NOT NULL,
+            repo_name TEXT NOT NULL,
+            notes TEXT,
+            status TEXT NOT NULL DEFAULT 'pending',
+            pid INTEGER,
+            work_dir TEXT,
+            log_path TEXT,
+            repo_url TEXT,
+            error TEXT,
+            started_at TEXT,
+            finished_at TEXT,
+            created_at TEXT NOT NULL
+        )""")
         conn.commit()
     except Exception as e:
         log.warning(f"Failed to create chat tables: {e}")
@@ -463,7 +502,7 @@ def _db(row_factory=False):
         conn.close()
 
 
-# ─── Persistent Notes (agent's memory) ──────────────────────────────────────
+# ─── Persistent Notes (the agent's memory) ───────────────────────────────────
 
 NOTE_CATEGORIES = {"goal", "person", "task", "stance", "learning", "note"}
 
@@ -1222,7 +1261,7 @@ def _sanitize_image(raw_path: str) -> str | None:
                 img = img.convert("RGB")
             # Re-encode as clean PNG — strips all metadata, EXIF, ICC profiles
             clean = tempfile.NamedTemporaryFile(
-                prefix="agent-clean-", suffix=".png", delete=False)
+                prefix="benthic-clean-", suffix=".png", delete=False)
             img.save(clean.name, format="PNG")
             clean.close()
             log.info(f"Image sanitized: {raw_path} -> {clean.name}")
@@ -1282,7 +1321,7 @@ def download_media(msg: dict) -> tuple[str | None, str]:
         # Step 2: download to temp file
         dl_url = f"https://api.telegram.org/file/bot{BOT_TOKEN}/{file_path}"
         ext = Path(file_path).suffix or ".tmp"
-        tmp = tempfile.NamedTemporaryFile(prefix="agent-media-", suffix=ext, delete=False)
+        tmp = tempfile.NamedTemporaryFile(prefix="benthic-media-", suffix=ext, delete=False)
         tmp_path = tmp.name
         with urllib.request.urlopen(dl_url, timeout=30) as resp:
             data = resp.read(MAX_MEDIA_SIZE + 1)
@@ -1392,192 +1431,47 @@ def check_thread_depth(msg: dict) -> bool:
     return True
 
 
-# ─── LLM Provider Layer (Claude primary, Codex fallback) ───────────────────
+# ─── LLM Provider Layer (chain driven by PROVIDER_ORDER env) ────────────────
 
-# Circuit breaker: if Claude CLI fails N times in a row, or hits a quota error,
-# stop using it temporarily and fall back to Codex.
-# No lock needed — chat bot is single-threaded (sync poll loop).
-_claude_failures = 0
-_claude_max_failures = 3
-_claude_unavailable_until = 0.0
+from providers import ClaudeProvider, CodexProvider, ProviderChain
 
 
-def _build_provider_env(bin_path: str) -> dict:
-    """Ensure the provider binary's directory is on PATH for subprocess execution."""
-    parent = str(Path(bin_path).expanduser().parent)
-    return {**os.environ, "PATH": f"{parent}:{os.environ.get('PATH', '')}"}
+def _bot_codex_wrapper(prompt: str) -> str:
+    return load_prompt("bot/codex_wrapper", agent_name=AGENT_NAME, prompt=prompt)
 
 
-def _looks_like_claude_limit_error(stdout: str, stderr: str) -> bool:
-    """Detect quota/rate-limit style failures that should trip long Claude cooldown."""
-    combined = f"{stdout}\n{stderr}".lower()
-    patterns = [
-        "status code 501", "http 501", "error 501",
-        "usage limit", "monthly usage", "quota", "credit balance",
-        "rate limit", "too many requests", "exhausted",
-        "payment required", "billing", "overloaded",
-        "hit your limit",
-    ]
-    return any(p in combined for p in patterns)
-
-
-def _mark_claude_unavailable(reason: str, cooldown: int = CLAUDE_LIMIT_COOLDOWN):
-    """Open the Claude breaker for a longer window when limits are hit."""
-    global _claude_failures, _claude_unavailable_until
-    until = time.time() + max(60, cooldown)
-    _claude_failures = _claude_max_failures
-    _claude_unavailable_until = max(_claude_unavailable_until, until)
-    log.warning(f"Claude marked unavailable for {int(max(60, cooldown))}s: {reason[:200]}")
-
-
-def _claude_is_available() -> bool:
-    """Return whether Claude should be attempted right now."""
-    if _claude_unavailable_until > time.time():
-        return False
-    return _claude_failures < _claude_max_failures
-
-
-def _claude_ask(prompt: str, timeout: int = 120, retries: int = 2,
-                tools: str = TOOLS_DEFAULT, model: str | None = None,
-                effort: str = "max") -> str:
-    """Blocking Claude CLI call with retry and quota-aware circuit breaker.
-    model: override default model (e.g. "sonnet" for cheap classification).
-    effort: "max", "high", or "low"."""
-    global _claude_failures
-
-    for attempt in range(retries + 1):
-        cooldown_remaining = max(0, int(_claude_unavailable_until - time.time()))
-        if cooldown_remaining > 0:
-            log.warning(f"Claude cooldown active ({cooldown_remaining}s remaining)")
-            return ""
-        if _claude_failures >= _claude_max_failures:
-            log.warning("Claude CLI circuit breaker open")
-            return ""
-
-        try:
-            cmd = [CLAUDE_BIN, "-p", "-", "--effort", effort, "--allowedTools", tools]
-            if model:
-                cmd.extend(["--model", model])
-            result = subprocess.run(
-                cmd,
-                input=prompt,
-                capture_output=True,
-                text=True,
-                timeout=timeout,
-                env=_build_provider_env(CLAUDE_BIN),
-                cwd=str(BASE_DIR),
-            )
-            response = result.stdout.strip()
-            stderr_out = result.stderr.strip() if result.stderr else ""
-            combined = f"{response}\n{stderr_out}".strip()
-
-            response_lower = response.lower()
-            combined_lower = combined.lower()
-            if (
-                result.returncode != 0
-                or not response
-                or response.startswith("Error:")
-                or response == "Execution error"
-                or "max turns" in response_lower
-                or "max turns" in combined_lower
-            ):
-                log.warning(f"Claude returned error (attempt {attempt+1}/{retries+1}): {combined[:200]}")
-                if stderr_out:
-                    log.warning(f"Claude stderr: {stderr_out[:500]}")
-                if _looks_like_claude_limit_error(response, stderr_out):
-                    _mark_claude_unavailable(combined or "quota/limit failure")
-                    return ""
-                if attempt < retries:
-                    time.sleep(5 * (attempt + 1))
-                    continue
-                _claude_failures += 1
-                return ""
-
-            # Success — reset circuit breaker
-            _claude_failures = 0
-            return response
-
-        except subprocess.TimeoutExpired:
-            log.error(f"Claude CLI timed out (attempt {attempt+1}/{retries+1})")
-            if attempt < retries:
-                time.sleep(5 * (attempt + 1))
-                continue
-            _claude_failures += 1
-            return ""
-        except Exception as e:
-            log.error(f"Claude CLI error (attempt {attempt+1}/{retries+1}): {e}")
-            if attempt < retries:
-                time.sleep(5 * (attempt + 1))
-                continue
-            _claude_failures += 1
-            return ""
-
-    return ""
-
-
-def _codex_ask(prompt: str, timeout: int = 120) -> str:
-    """Blocking Codex CLI call used when Claude is unavailable or fails."""
-    wrapped = load_prompt("bot/codex_wrapper", agent_name=AGENT_NAME, prompt=prompt)
-    output_path = None
-    try:
-        with tempfile.NamedTemporaryFile(prefix="agent-codex-", suffix=".txt", delete=False) as tmp:
-            output_path = tmp.name
-        result = subprocess.run(
-            [
-                CODEX_BIN, "exec",
-                "--skip-git-repo-check",
-                "--ephemeral",
-                "--dangerously-bypass-approvals-and-sandbox",
-                "-C", str(BASE_DIR),
-                "-m", CODEX_MODEL,
-                "-o", output_path,
-                "-",
-            ],
-            input=wrapped,
-            capture_output=True,
-            text=True,
-            timeout=timeout,
-            env=_build_provider_env(CODEX_BIN),
-            cwd=str(BASE_DIR),
-        )
-        response = ""
-        if output_path and Path(output_path).exists():
-            response = Path(output_path).read_text().strip()
-        if not response and result.stdout:
-            response = result.stdout.strip()
-        if result.returncode != 0 or not response:
-            log.error(f"Codex fallback failed: {(result.stderr or result.stdout or '')[:500]}")
-            return ""
-        return response
-    except subprocess.TimeoutExpired:
-        log.error("Codex fallback timed out")
-        return ""
-    except Exception as e:
-        log.error(f"Codex fallback error: {e}")
-        return ""
-    finally:
-        if output_path:
-            try:
-                Path(output_path).unlink(missing_ok=True)
-            except Exception:
-                pass
+_claude_provider = ClaudeProvider(
+    bin=CLAUDE_BIN,
+    default_effort="max",
+    default_tools=TOOLS_DEFAULT,
+    cwd=str(BASE_DIR),
+    quota_cooldown=CLAUDE_LIMIT_COOLDOWN,
+)
+_codex_provider = CodexProvider(
+    bin=CODEX_BIN,
+    model=CODEX_MODEL,
+    effort=CODEX_EFFORT,
+    cwd=str(BASE_DIR),
+    sandbox_bypass=True,
+    wrapper=_bot_codex_wrapper,
+)
+_provider_chain = ProviderChain.from_env_order(
+    "PROVIDER_ORDER", default="codex,claude",
+    providers={"claude": _claude_provider, "codex": _codex_provider},
+)
+log.info(f"LLM provider chain: {','.join(_provider_chain.names())}")
 
 
 def llm_ask(prompt: str, timeout: int = 120, tools: str = TOOLS_DEFAULT,
-            model: str | None = None, effort: str = "max") -> str:
-    """Invoke Claude first, then fall back to Codex when Claude is unavailable.
-    model: override default model (e.g. "sonnet" for cheap classification).
-    effort: "max", "high", or "low"."""
-    # Strip unpaired surrogates from the full prompt — they cause Claude API JSON parse errors
-    prompt = prompt.encode('utf-8', errors='surrogatepass').decode('utf-8', errors='ignore')
-    primary = ""
-    if _claude_is_available():
-        primary = _claude_ask(prompt, timeout=timeout, tools=tools,
-                              model=model, effort=effort)
-    if primary:
-        return primary
-    log.warning("Falling back to Codex for chat response")
-    return _codex_ask(prompt, timeout=timeout)
+            tier: str | None = None,
+            model: str | None = None, effort: str | None = None) -> str:
+    """Dispatch through the provider chain.
+
+    tier: semantic tier label. Use tier='classification' for cheap, fast calls
+    (pre-screen). The active provider maps it to its own model/effort.
+    model / effort: explicit per-call overrides (beat the tier preset)."""
+    return _provider_chain.ask(prompt, timeout=timeout,
+                                tier=tier, model=model, effort=effort, tools=tools)
 
 
 # ─── Response Generation ────────────────────────────────────────────────────
@@ -1588,7 +1482,7 @@ AGENT_SOUL = ""
 if SOUL_FILE.exists():
     AGENT_SOUL = SOUL_FILE.read_text().strip()
 
-# Agent identity prompt — loaded once, reused for every response
+# The agent's identity prompt — loaded once, reused for every response
 AGENT_IDENTITY = load_prompt("bot/identity", agent_name=AGENT_NAME, bot_username=BOT_USERNAME, AGENT_DIR=AGENT_DIR)
 
 
@@ -1633,9 +1527,9 @@ def generate_response(msg: dict, is_direct: bool, recent_messages: list,
     # to decide SKIP vs ENGAGE. Saves ~9,000 tokens on the ~70% of messages the agent skips.
     # Runs BEFORE expensive DB queries and context building.
 
-    # Check if this message is a reply to someone else (not our bot).
+    # Check if this message is a reply to someone else (not the bot).
     # Used as context hint in pre-screen — not a hard filter, because the operator
-    # might reply to Shark while discussing something our bot did.
+    # might reply to another participant while discussing something the bot did.
     reply_to_other = False
     reply_msg = msg.get("reply_to_message")
     if reply_msg and not is_direct:
@@ -1647,12 +1541,12 @@ def generate_response(msg: dict, is_direct: bool, recent_messages: list,
     text_lower = (safe_text or "").lower()
     sender_username = (sender.get("username") or "").lower()
     # No operator bypass — operators chat like everyone else, pre-screen saves tokens.
-    # Only bypass for: direct mentions/replies to the bot, lnn_headline_bot responses,
-    # messages mentioning the bot by name, and market-relevant keywords.
+    # Only bypass for: direct mentions/replies to the bot, the headline-bot account's responses,
+    # messages mentioning the agent by name, and market-relevant keywords.
     bypass_prescreen = (
         is_direct
         or (BOT_USERNAME and BOT_USERNAME in text_lower)
-        or sender_username == "lnn_headline_bot"
+        or (HEADLINE_BOT_USERNAME and sender_username == HEADLINE_BOT_USERNAME)
         or any(kw in text_lower for kw in (
             "market #", "new market", "/buy", "/sell", "/position",
             "bought", "sold", "buy failed", "sell failed",
@@ -1682,7 +1576,7 @@ def generate_response(msg: dict, is_direct: bool, recent_messages: list,
                 sender_label=sender_label,
                 safe_text_truncated=safe_text[:300],
                 reply_hint=reply_hint),
-            timeout=30, tools="__none__", model="sonnet", effort="low",
+            timeout=30, tools="__none__", tier="classification",
         )
         if prescreen and prescreen.strip().upper().startswith("NO"):
             log.info(f"Pre-screen SKIP for @{safe_username}: {safe_text[:60]}")
@@ -1796,10 +1690,9 @@ def generate_response(msg: dict, is_direct: bool, recent_messages: list,
     tools = TOOLS_OPERATOR if operator else TOOLS_DEFAULT
     # Generous timeouts — let the LLM think and use tools.
     # The real protection against hangs is the private-link prompt instruction + error feedback.
-    # Operator DM: 300s (5 min) per attempt — complex tasks with WebFetch + research.
-    # Group/non-operator: 120s per attempt — standard chat responses.
-    # 10 min for all — sandbox tool calls (docker run + code execution) need headroom
-    timeout = 600
+    # 30 min for all — sandbox tool calls (docker run + code execution) + multi-step
+    # research (WebFetch + grep + sandbox analysis) need generous headroom.
+    timeout = 1800
     response = llm_ask(prompt, timeout=timeout, tools=tools)
     if not response or len(response) < 3:
         return None
@@ -1831,9 +1724,11 @@ def generate_response(msg: dict, is_direct: bool, recent_messages: list,
 
 # ─── Autonomous Trading ─────────────────────────────────────────────────────
 
-def _fetch_market_data() -> str:
+def _fetch_market_data() -> tuple[str, dict]:
     """Fetch open markets and our positions from the LN API.
-    Returns formatted text for the LLM prompt, or empty string on failure."""
+    Returns (formatted_text, snapshot_dict). Snapshot is used by the cache gate
+    to detect material change without another network round-trip.
+    On failure, returns ("", {})."""
     try:
         # Markets list — public, no auth needed
         markets_resp = urllib.request.urlopen(
@@ -1844,8 +1739,10 @@ def _fetch_market_data() -> str:
         markets = json.loads(markets_resp.read())
         market_list = markets.get("results", [])
         if not market_list:
-            return ""
+            log.info("Market data: API returned no open markets")
+            return "", {}
 
+        snapshot: dict = {}
         lines = ["OPEN PREDICTION MARKETS (live data from API):"]
         for m in market_list:
             # API returns yes_price as decimal (0.53), convert to percentage
@@ -1854,6 +1751,11 @@ def _fetch_market_data() -> str:
                 no_pct = round(float(m.get("no_price", 0)) * 100, 1)
             except (ValueError, TypeError):
                 yes_pct, no_pct = "?", "?"
+            mid = m.get("id")
+            if mid is not None:
+                snapshot[str(mid)] = {
+                    "yes": yes_pct if isinstance(yes_pct, (int, float)) else None,
+                }
             volume = m.get("total_volume", "?")
             traders = m.get("num_traders", "?")
             expires = m.get("expires_at") or "no expiry"
@@ -1888,10 +1790,76 @@ def _fetch_market_data() -> str:
             except Exception as e:
                 log.debug(f"Failed to fetch positions: {e}")
 
-        return "\n".join(lines)
+        return "\n".join(lines), snapshot
     except Exception as e:
         log.debug(f"Failed to fetch market data: {e}")
-        return ""
+        return "", {}
+
+
+# ─── Market analysis cache gate ──────────────────────────────────────────────
+# Persistent cache of the last-analyzed market snapshot. The gate below uses
+# it to skip the expensive Opus+tools LLM call when nothing material has changed.
+_MARKET_ANALYSIS_CACHE = Path.home() / ".claude" / ".market_analysis_cache.json"
+# Gate thresholds (env-overridable)
+MARKET_PRICE_DELTA_PCT = float(os.environ.get("MARKET_PRICE_DELTA_PCT", "3.0"))  # trigger if any YES price moved ≥ this
+MARKET_CACHE_MAX_AGE = int(os.environ.get("MARKET_CACHE_MAX_AGE", "21600"))  # 6h — force periodic refresh
+
+def _load_market_cache() -> dict:
+    try:
+        return json.loads(_MARKET_ANALYSIS_CACHE.read_text())
+    except FileNotFoundError:
+        return {}
+    except Exception as e:
+        # Log on load failure — corrupt cache silently falls back to "re-analyze"
+        # (safe default) but the error is worth seeing in logs if it repeats.
+        log.debug(f"Market cache load failed: {e}")
+        return {}
+
+def _save_market_cache(snapshot: dict, decision: str) -> None:
+    try:
+        # Atomic write: temp file + rename. Protects against crash mid-write
+        # corrupting the cache file (would cause a harmless re-analyze on
+        # next cycle, but still worth avoiding).
+        tmp = _MARKET_ANALYSIS_CACHE.with_suffix(".tmp")
+        tmp.write_text(json.dumps({
+            "snapshot": snapshot,
+            "decision": decision,
+            "analyzed_at": time.time(),
+        }))
+        tmp.replace(_MARKET_ANALYSIS_CACHE)
+    except Exception as e:
+        log.debug(f"Failed to save market cache: {e}")
+
+def _analysis_warranted(current: dict) -> tuple[bool, str]:
+    """Decide whether to run the expensive Opus+tools LLM analysis.
+    Returns (warranted, reason). Cheap check — no LLM, no network."""
+    cache = _load_market_cache()
+    prev = cache.get("snapshot", {})
+    analyzed_at = cache.get("analyzed_at", 0)
+    if not prev:
+        return True, "no cached analysis"
+    if time.time() - analyzed_at > MARKET_CACHE_MAX_AGE:
+        return True, f"cache stale ({int((time.time() - analyzed_at) / 3600)}h old)"
+    new_markets = set(current) - set(prev)
+    if new_markets:
+        return True, f"new markets: {sorted(new_markets)}"
+    closed_markets = set(prev) - set(current)
+    if closed_markets:
+        return True, f"markets closed: {sorted(closed_markets)}"
+    max_delta = 0.0
+    delta_market = None
+    for mid, snap in current.items():
+        prev_snap = prev.get(mid, {})
+        cur_yes = snap.get("yes")
+        prev_yes = prev_snap.get("yes")
+        if isinstance(cur_yes, (int, float)) and isinstance(prev_yes, (int, float)):
+            delta = abs(cur_yes - prev_yes)
+            if delta > max_delta:
+                max_delta = delta
+                delta_market = mid
+    if max_delta >= MARKET_PRICE_DELTA_PCT:
+        return True, f"price moved {max_delta:.1f}% on #{delta_market} (threshold {MARKET_PRICE_DELTA_PCT}%)"
+    return False, f"no material change (max move {max_delta:.1f}%)"
 
 
 # Cached positions string — refreshed every 5 minutes, included in every
@@ -1950,12 +1918,26 @@ def _check_markets(recent_messages: list[dict]):
         pass
 
     log.info("Periodic market check starting")
+
+    # No provider-availability gate — both Claude and Codex have research tool
+    # access (Claude via --allowedTools whitelist, Codex via the sandbox bypass).
+    # If both providers are down, the chain returns "" and the caller handles it.
+
     try:
         # Fetch live market data from LN API — no need to rely on chat context
-        market_data = _fetch_market_data()
+        market_data, snapshot = _fetch_market_data()
         if not market_data:
             log.info("Market check: no open markets")
             return
+
+        # Cheap gate: skip the Opus+tools call if nothing material has changed
+        # since last analysis. Price delta threshold + staleness ceiling ensure
+        # we still re-analyze periodically when markets truly are stable.
+        warranted, reason = _analysis_warranted(snapshot)
+        if not warranted:
+            log.info(f"Market check: skipped — {reason}")
+            return
+        log.info(f"Market check: running full analysis — {reason}")
 
         # Build recent chat context for sentiment/discussion awareness
         chat_lines = []
@@ -1977,41 +1959,78 @@ def _check_markets(recent_messages: list[dict]):
             own_actions=own_actions,
             memory=memory)
 
-        response = llm_ask(prompt, timeout=120, tools="__none__",
-                          model="sonnet", effort="low")
-        if not response or response.strip().upper() == "PASS":
-            log.info("Market check: no trades")
+        # Market check needs research tools to find edges in stable markets —
+        # WebSearch/WebFetch for breaking news, sandbox for on-chain verification.
+        # Sonnet/low with no tools kept returning PASS because it had no way to
+        # verify a thesis. Opus with tools can form and defend a trade decision.
+        market_tools = f"WebSearch,WebFetch,Bash({AGENT_DIR}/sandbox/run-sandbox.sh*)"
+        t_start = time.time()
+        response = llm_ask(prompt, timeout=600, tools=market_tools)
+        elapsed = time.time() - t_start
+        # Prompt emits research/reasoning before the final JSON/PASS line.
+        # Extract the last non-empty line for the decision check.
+        last_line = ""
+        if response:
+            for line in reversed(response.strip().splitlines()):
+                if line.strip():
+                    last_line = line.strip()
+                    break
+
+        # CACHE INVARIANT: once the LLM returns, we've analyzed this snapshot —
+        # save the cache immediately so downstream failures (injection detected,
+        # JSON parse fail, auth fail, trade execution fail) don't cause the gate
+        # to re-trigger on the same state. Trade execution errors are orthogonal
+        # to "did we evaluate this state"; retrying won't help.
+        if not response:
+            log.info(f"Market check: empty LLM response ({elapsed:.1f}s)")
+            _save_market_cache(snapshot, "EMPTY")
             return
+        if last_line.upper() == "PASS":
+            log.info(f"Market check: no trades ({elapsed:.1f}s)")
+            _save_market_cache(snapshot, "PASS")
+            return
+
+        log.info(f"Market check: potential trades found ({elapsed:.1f}s, {len(response)} chars)")
 
         # Validate output before processing
         if check_output_for_injection(response, context="market_check"):
             log.warning("Market check: injection detected in response — aborting")
+            _save_market_cache(snapshot, "BLOCKED_INJECTION")
             return
         if check_leak_patterns(response):
             log.warning("Market check: leaked monologue detected in response — aborting")
+            _save_market_cache(snapshot, "BLOCKED_LEAK")
             return
         if check_structural_leaks(response):
             log.warning("Market check: structural leak detected in response — aborting")
+            _save_market_cache(snapshot, "BLOCKED_LEAK")
             return
 
-        log.info(f"Market check raw response: {response[:200]}")
+        log.info(f"Market check raw response tail: {response[-300:]}")
 
-        # Parse JSON trades
+        # Parse JSON trades — look on last non-empty line (prompt may have
+        # research/reasoning before the final decision line)
         try:
-            # Strip markdown fences if present
-            clean = response.strip()
+            clean = last_line
             if clean.startswith("```"):
                 clean = re.sub(r'^```\w*\n?', '', clean)
                 clean = re.sub(r'\n?```$', '', clean)
+            # Fallback: try extracting any JSON array from the full response
+            if not clean.startswith("["):
+                m = re.search(r'\[.*\]', response, re.DOTALL)
+                if m:
+                    clean = m.group(0)
             trades = json.loads(clean.strip())
             if not isinstance(trades, list):
                 trades = [trades]
         except (json.JSONDecodeError, ValueError):
-            log.warning(f"Market check: failed to parse trade JSON: {response[:200]}")
+            log.warning(f"Market check: failed to parse trade JSON from last line: {last_line[:200]}")
+            _save_market_cache(snapshot, "PARSE_FAIL")
             return
 
         if not _relay or not _relay._ensure_auth():
             log.warning("Market check: no authenticated session for API trades")
+            _save_market_cache(snapshot, "AUTH_FAIL")
             return
 
         # Execute trades via LN API
@@ -2023,6 +2042,24 @@ def _check_markets(recent_messages: list[dict]):
 
             if action not in ("buy", "sell") or not market_id or not side or not amount:
                 log.warning(f"Market check: invalid trade spec: {trade}")
+                continue
+
+            # Defense against prompt injection via WebFetch content:
+            # bound per-trade amount to prevent a poisoned page convincing the
+            # model to emit a massive trade. 500 SQUID per trade is the prompt cap.
+            try:
+                amount_f = float(amount)
+            except (TypeError, ValueError):
+                log.warning(f"Market check: non-numeric amount in trade: {trade}")
+                continue
+            if amount_f <= 0:
+                log.warning(f"Market check: non-positive amount in trade: {trade}")
+                continue
+            if action == "buy" and amount_f > MAX_MARKET_BUY_SQUID:
+                log.warning(
+                    f"Market check: buy amount {amount_f} exceeds cap "
+                    f"{MAX_MARKET_BUY_SQUID} — rejecting trade: {trade}"
+                )
                 continue
 
             try:
@@ -2058,6 +2095,13 @@ def _check_markets(recent_messages: list[dict]):
             except Exception as e:
                 log.warning(f"Market trade error: {action} #{market_id} — {e}")
             time.sleep(1)  # space out API calls
+
+        # Save cache AFTER trade execution so the gate reflects "acted on this
+        # snapshot" rather than "decided to act." If trade execution failed for
+        # all trades, state hasn't changed but the LLM did run — caching anyway
+        # prevents immediate re-triggering (LLM retry won't help without a fresh
+        # signal). The 6h staleness ceiling ensures periodic re-analysis.
+        _save_market_cache(snapshot, "TRADE")
     except Exception as e:
         log.error(f"Market check failed: {e}")
         return
@@ -2127,7 +2171,7 @@ def _poll_agent_chat(recent_messages: list[dict]) -> list[dict]:
     try:
         req = urllib.request.Request(
             f"{AGENT_CHAT_HISTORY_URL}?limit=30",
-            headers={"User-Agent": "LN-Agent-Bot/1.0"},
+            headers={"User-Agent": f"{AGENT_NAME}-Bot/1.0"},
         )
         with urllib.request.urlopen(req, timeout=10) as resp:
             data = json.loads(resp.read())
@@ -2185,7 +2229,7 @@ def _poll_agent_chat(recent_messages: list[dict]) -> list[dict]:
         # Check if this mentions us — needs a response.
         # Content dedup: skip if we already responded to this exact message via Telegram.
         text_lower = text.lower()
-        if BOT_USERNAME and (f"@{BOT_USERNAME}" in text_lower or f"@{AGENT_NAME.lower()}" in text_lower):
+        if "@benthic_bot" in text_lower or "@benthic" in text_lower:
             ck = _content_key(m.get("from_id", 0), text)
             ck_text = _content_key(0, text)  # text-only for cross-path dedup
             if msg_id not in _api_responded and ck not in _content_responded and ck_text not in _content_responded:
@@ -2264,7 +2308,7 @@ def poll():
     # Per-chat rolling buffer — prevents context leaking between groups
     recent_by_chat: dict[tuple, list[dict]] = {}  # (chat_id, topic_id) -> [messages]
 
-    log.info("Chat bot listener started")
+    log.info(f"{AGENT_NAME} Bot listener started")
 
     try:
         me = tg_request("getMe")
@@ -2317,7 +2361,7 @@ def poll():
                     media_note = f"[sticker: {msg['sticker'].get('emoji', '')}] "
                 if media_note:
                     # Prepend media note to text so content key distinguishes
-                    # "just @Bot" from "[document: file.md] @Bot"
+                    # a bare mention from one with an attachment (e.g. media-only vs caption).
                     text = f"{media_note}{text}" if text else media_note.strip()
 
                 log.info(f"[{chat.get('title', 'DM')}] @{sender.get('username', '?')} "
@@ -2401,7 +2445,7 @@ def poll():
                     if reply_msg:
                         reply_from = reply_msg.get("from", {})
                         reply_to_us = BOT_USERNAME and reply_from.get("username", "").lower() == BOT_USERNAME
-                    is_mention = BOT_USERNAME and (f"@{BOT_USERNAME}" in text_lower or f"@{AGENT_NAME.lower()}" in text_lower)
+                    is_mention = "@benthic_bot" in text_lower or "@benthic" in text_lower
                     is_direct = reply_to_us or is_mention
 
                 # Generate response — pass chat-specific context only.
@@ -2616,7 +2660,11 @@ def poll():
                 api_text = api_msg.get("text", "")
                 api_sender = api_msg.get("from", {})
                 api_msg_id = api_msg["message_id"]
-                api_topic = api_msg.get("message_thread_id", 1)
+                # Buffer stores General as message_thread_id=1 for context consistency,
+                # but Telegram Bot API rejects thread_id=1 for General ("thread not found").
+                # Convert sentinel 1 → None so send_message omits the field for General.
+                _raw_topic = api_msg.get("message_thread_id", 1)
+                api_topic = None if _raw_topic == 1 else _raw_topic
 
                 log.info(f"[API] @{api_sender.get('username', '?')}: {sanitize_untrusted(api_text, max_len=100)}")
 

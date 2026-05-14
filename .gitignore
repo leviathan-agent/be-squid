@@ -22,7 +22,12 @@ bot.log
 *.txt
 !requirements.txt
 !requirements-dev.txt
+!sandbox/*.txt
 sec-filing-snapshot.md
 march-2026-headline-review.md
 GEMINI.md
 knowledge.json
+
+# Runtime state
+.poll_offset
+.last_market_check

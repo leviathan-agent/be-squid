@@ -1,12 +1,12 @@
-# Benthic Sandbox
+# Agent Sandbox
 
-Isolated Docker environment for Benthic Bot code execution.
+Isolated Docker environment for the agent code execution.
 
 ## Setup
 
 ```bash
 # 1. Build the image
-docker build -t benthic-sandbox sandbox/
+docker build -t agent-sandbox sandbox/
 
 # 2. Set up the network with allowlisted hosts
 sudo sandbox/setup-network.sh
@@ -33,7 +33,7 @@ Edit `allowed-hosts.txt` and re-run `sudo setup-network.sh` to add endpoints.
 
 ## Resource limits
 
-- 256MB RAM, 1 CPU, 30s timeout, 50MB tmpfs scratch
+- 512MB RAM, 1 CPU, 120s timeout, 100MB tmpfs scratch
 - Read-only filesystem, non-root user, no-new-privileges
 - PID limit: 64 (fork bomb protection)
 

@@ -1,4 +1,4 @@
-"""Benthic Sandbox Helpers — pre-built patterns for common onchain and data queries.
+"""Agent Sandbox Helpers — pre-built patterns for common onchain and data queries.
 
 Usage from sandbox:
     from helpers import get_web3, get_chain, explorer, defi_llama, coingecko
@@ -206,37 +206,47 @@ class ExplorerAPI:
             raise RuntimeError(f"Explorer API error: {msg}")
         return data.get("result", [])
 
-    def token_holders(self, contract: str, page: int = 1, limit: int = 25) -> list[dict]:
-        """Get top token holders (if supported by explorer).
-        Returns list of {address, balance, share_pct}."""
-        # Try tokentx approach — get all transfers and aggregate
-        # Most explorers don't have a direct top-holders endpoint on free tier
-        # Fall back to Transfer event scanning via the API (indexed, fast)
-        transfers = self._get(
-            module="account", action="tokentx",
-            contractaddress=contract,
-            startblock=0, endblock=99999999,
-            page=page, offset=10000, sort="asc"
-        )
-        if not isinstance(transfers, list):
-            return []
-        # Aggregate balances from transfers
+    def token_holders(self, contract: str, limit: int = 25, max_pages: int = 50) -> list[dict]:
+        """Get top token holders by paginating ALL token transfers and aggregating balances.
+        Returns list of {address, balance, share_pct}.
+
+        The free-tier Etherscan V2 `tokenholderlist` action requires Pro access.
+        This method works around that by pulling ALL historical Transfer events via
+        the free `tokentx` endpoint and computing current balances from the deltas.
+
+        Pagination: 10,000 transfers per page, up to max_pages (default 50 = 500k
+        transfers). For tokens with more history, raise max_pages or use
+        token_holders_rpc() which scans events directly via eth_getLogs.
+        """
         balances: dict[str, int] = {}
-        for tx in transfers:
-            value = int(tx.get("value", 0))
-            from_addr = tx.get("from", "").lower()
-            to_addr = tx.get("to", "").lower()
-            balances[from_addr] = balances.get(from_addr, 0) - value
-            balances[to_addr] = balances.get(to_addr, 0) + value
+        decimals = 18
+        for page in range(1, max_pages + 1):
+            transfers = self._get(
+                module="account", action="tokentx",
+                contractaddress=contract,
+                startblock=0, endblock=99999999,
+                page=page, offset=10000, sort="asc"
+            )
+            if not isinstance(transfers, list) or not transfers:
+                break  # no more pages
+            if page == 1:
+                decimals = int(transfers[0].get("tokenDecimal", 18))
+            for tx in transfers:
+                value = int(tx.get("value", 0))
+                from_addr = tx.get("from", "").lower()
+                to_addr = tx.get("to", "").lower()
+                balances[from_addr] = balances.get(from_addr, 0) - value
+                balances[to_addr] = balances.get(to_addr, 0) + value
+            if len(transfers) < 10000:
+                break  # last page (partial)
         # Sort by balance, filter out zero/negative, return top N
-        decimals = int(transfers[0].get("tokenDecimal", 18)) if transfers else 18
-        total_supply = sum(v for v in balances.values() if v > 0)
+        total_positive = sum(v for v in balances.values() if v > 0)
         holders = []
         for addr, raw_bal in sorted(balances.items(), key=lambda x: x[1], reverse=True):
             if raw_bal <= 0:
                 continue
             bal = raw_bal / (10 ** decimals)
-            pct = (raw_bal / total_supply * 100) if total_supply > 0 else 0
+            pct = (raw_bal / total_positive * 100) if total_positive > 0 else 0
             holders.append({"address": addr, "balance": round(bal, 2), "share_pct": round(pct, 2)})
             if len(holders) >= limit:
                 break

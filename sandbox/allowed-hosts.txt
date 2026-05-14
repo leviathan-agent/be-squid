@@ -1,0 +1,35 @@
+# Agent Sandbox — allowed outbound hosts
+# One hostname per line. setup-network.sh resolves these to IPs for iptables rules.
+# Re-run setup-network.sh after editing.
+
+# Ethereum RPCs
+mainnet.infura.io
+eth-mainnet.g.alchemy.com
+rpc.ankr.com
+cloudflare-eth.com
+
+# L2 RPCs
+arb1.arbitrum.io
+mainnet.optimism.io
+mainnet.base.org
+rpc.linea.build
+
+# Fraxtal RPCs (SQUID token chain)
+rpc.frax.com
+fraxtal-rpc.publicnode.com
+
+# Block explorers (API endpoints)
+api.etherscan.io
+api.basescan.org
+api.arbiscan.io
+api.optimistic.etherscan.io
+api.fraxscan.com
+
+# Data APIs
+api.llama.fi
+pro-api.coingecko.com
+api.coingecko.com
+api.dune.com
+
+# DNS (handled separately in setup-network.sh, listed here for documentation)
+# dns: 53/udp

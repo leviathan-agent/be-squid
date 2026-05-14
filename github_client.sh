@@ -3,7 +3,7 @@
 #
 # Enforces:
 #   - Repo allowlist (hard reject if repo not listed)
-#   - Rate limit for non-operators (3 writes/day per user)
+#   - Rate limit for non-operators (default 30 writes/day per user; override via RATE_LIMIT_MAX env)
 #   - Attribution footer on non-operator writes
 #   - Subcommand whitelist (only issue/pr/allowlist commands)
 #
@@ -15,9 +15,14 @@ set -euo pipefail
 # ─── Configuration ──────────────────────────────────────────────────────────
 TOKEN_FILE="$HOME/.claude/.github-token"
 ALLOWLIST_FILE="$HOME/.claude/.github-repos-allowlist"
+# GitHub org/user that newly-created repos belong to (used to auto-add them to
+# the allowlist and to compute the canonical full repo name for `repo create`
+# and `repo push`). Defaults to empty — set GITHUB_ORG in the env or the
+# wrapper will fall back to whatever org `gh repo create` happens to use.
+GITHUB_ORG="${GITHUB_ORG:-}"
 RATE_LIMIT_FILE="$HOME/.claude/.github-rate-limit"
-RATE_LIMIT_MAX=3          # max write actions per non-operator per 24h
-RATE_LIMIT_WINDOW=86400   # 24 hours in seconds
+RATE_LIMIT_MAX="${RATE_LIMIT_MAX:-30}"         # max write actions per non-operator per 24h
+RATE_LIMIT_WINDOW="${RATE_LIMIT_WINDOW:-86400}" # 24 hours in seconds
 
 # ─── Load token ─────────────────────────────────────────────────────────────
 if [[ ! -f "$TOKEN_FILE" ]]; then
@@ -49,7 +54,7 @@ done
 
 if [[ $# -lt 1 ]]; then
     echo "Usage: github_client.sh [--operator] [--user USERNAME] <subcommand> <args...>" >&2
-    echo "Subcommands: issue create|close|comment, pr create|comment, allowlist add|list" >&2
+    echo "Subcommands: issue create|close|comment|edit, pr create|comment, allowlist add|list" >&2
     exit 1
 fi
 
@@ -59,7 +64,7 @@ shift
 
 case "$SUBCMD" in
     issue)
-        [[ $# -lt 1 ]] && { echo "ERROR: issue requires action (create|close|comment)" >&2; exit 1; }
+        [[ $# -lt 1 ]] && { echo "ERROR: issue requires action (create|close|comment|edit)" >&2; exit 1; }
         ACTION="$1"; shift
         ;;
     pr)
@@ -230,6 +235,34 @@ cmd_issue_comment() {
     fi
 }
 
+cmd_issue_edit() {
+    # Parse: <repo> <number> --body "..."
+    # Edits the issue body (REPLACES entire body with new content).
+    # Operator-only: non-operators cannot overwrite issue bodies (destructive,
+    # could wipe operator-authored content even with rate limit + attribution).
+    # Non-operators should use `issue comment` instead to add to discussions.
+    [[ "$IS_OPERATOR" != "true" ]] && {
+        echo "ERROR: 'issue edit' is operator-only — it replaces issue body content." >&2
+        echo "Non-operators: use 'issue comment' to add to discussions instead." >&2
+        exit 1
+    }
+    [[ $# -lt 2 ]] && { echo "ERROR: issue edit requires <repo> <number>" >&2; exit 1; }
+    local repo="$1" number="$2"; shift 2
+    [[ ! "$number" =~ ^[0-9]+$ ]] && { echo "ERROR: issue number must be a positive integer" >&2; exit 1; }
+    local body=""
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --body) body="$2"; shift 2 ;;
+            *) echo "ERROR: Unknown flag '$1' for issue edit. Allowed: --body" >&2; exit 1 ;;
+        esac
+    done
+    [[ -z "$body" ]] && { echo "ERROR: --body is required" >&2; exit 1; }
+
+    check_allowlist "$repo" || { echo "ERROR: Repo '$repo' is not in the allowlist." >&2; exit 1; }
+
+    gh issue edit "$number" -R "$repo" --body "$body"
+}
+
 cmd_pr_create() {
     # Parse: <repo> --title "..." --body "..." --head "..." --base "..."
     local repo="$1"; shift
@@ -312,17 +345,74 @@ cmd_repo_create() {
     local args=("--public")
     [[ -n "$description" ]] && args+=("--description" "$description")
     gh repo create "$name" "${args[@]}"
-    # Auto-add to allowlist so the agent can interact with the new repo.
-    # Resolves the authenticated GitHub user at runtime via `gh api user`.
-    local gh_user
-    gh_user="$(gh api user --jq '.login' 2>/dev/null)" || { echo "WARNING: Could not resolve GitHub user for auto-allowlist" >&2; return 0; }
-    local full_name="$gh_user/$name"
+    # Auto-add to allowlist so the agent can interact with the new repo
+    local full_name="${GITHUB_ORG:-$(gh api user --jq .login)}/$name"
     if [[ -f "$ALLOWLIST_FILE" ]] && grep -qxF "$full_name" "$ALLOWLIST_FILE" 2>/dev/null; then
         : # already in allowlist
     else
         echo "$full_name" >> "$ALLOWLIST_FILE"
         echo "Auto-added '$full_name' to the allowlist."
     fi
+}
+
+cmd_repo_push() {
+    # Usage: repo push <name> [workdir] [--description "..."]
+    # Creates the repo (if missing), sets origin, pushes the workdir's `main` branch,
+    # auto-allowlists, and prints the canonical https URL on success.
+    # The workdir must already be a git repo with at least one commit on `main`.
+    [[ $# -lt 1 ]] && { echo "ERROR: repo push requires <name> [workdir]" >&2; exit 1; }
+    local name="$1"; shift
+    local workdir="."
+    local description=""
+    if [[ $# -gt 0 && "$1" != --* ]]; then
+        workdir="$1"; shift
+    fi
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --description) description="$2"; shift 2 ;;
+            *) echo "ERROR: Unknown flag '$1' for repo push." >&2; exit 1 ;;
+        esac
+    done
+    if [[ ! "$name" =~ ^[a-zA-Z0-9._-]+$ ]]; then
+        echo "ERROR: Invalid repo name. Use alphanumeric, hyphens, underscores, dots." >&2
+        exit 1
+    fi
+    if [[ ! -d "$workdir/.git" ]]; then
+        echo "ERROR: '$workdir' is not a git repo. Run 'git init && git add . && git commit' first." >&2
+        exit 1
+    fi
+    cd "$workdir"
+    # Ensure branch is named main (gh push expects HEAD branch matches remote default)
+    local current_branch
+    current_branch="$(git symbolic-ref --short HEAD 2>/dev/null || echo "")"
+    if [[ "$current_branch" != "main" ]]; then
+        git branch -M main
+    fi
+    # Create repo if it doesn't exist; ignore conflict if it does
+    local args=("--public")
+    [[ -n "$description" ]] && args+=("--description" "$description")
+    if ! gh repo view "$name" >/dev/null 2>&1; then
+        gh repo create "$name" "${args[@]}" --source=. --remote=origin --push
+    else
+        # Repo exists — make sure origin points at it and push
+        local existing_url
+        existing_url="$(gh repo view "$name" --json url -q .url)"
+        if ! git remote get-url origin >/dev/null 2>&1; then
+            git remote add origin "$existing_url"
+        fi
+        # gh credential helper uses GH_TOKEN automatically for https pushes
+        gh auth setup-git >/dev/null 2>&1 || true
+        git push -u origin main
+    fi
+    # Auto-allowlist
+    local full_name="${GITHUB_ORG:-$(gh api user --jq .login)}/$name"
+    if [[ -f "$ALLOWLIST_FILE" ]] && grep -qxF "$full_name" "$ALLOWLIST_FILE" 2>/dev/null; then
+        : # already
+    else
+        echo "$full_name" >> "$ALLOWLIST_FILE"
+    fi
+    # Print final URL on its own line so callers can grep it
+    gh repo view "$name" --json url -q .url
 }
 
 cmd_allowlist_add() {
@@ -356,14 +446,16 @@ case "$SUBCMD/$ACTION" in
     issue/create)   cmd_issue_create "$@" ;;
     issue/close)    cmd_issue_close "$@" ;;
     issue/comment)  cmd_issue_comment "$@" ;;
+    issue/edit)     cmd_issue_edit "$@" ;;
     pr/create)      cmd_pr_create "$@" ;;
     pr/comment)     cmd_pr_comment "$@" ;;
     repo/create)    cmd_repo_create "$@" ;;
+    repo/push)      cmd_repo_push "$@" ;;
     allowlist/add)  cmd_allowlist_add "$@" ;;
     allowlist/list) cmd_allowlist_list ;;
     *)
         echo "ERROR: Unknown command '$SUBCMD $ACTION'." >&2
-        echo "Allowed: issue create|close|comment, pr create|comment, repo create, allowlist add|list" >&2
+        echo "Allowed: issue create|close|comment|edit, pr create|comment, repo create|push, allowlist add|list" >&2
         exit 1
         ;;
 esac

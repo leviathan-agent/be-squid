@@ -83,25 +83,28 @@ def load_credentials() -> tuple:
 CLAUDE_BIN = os.environ.get("CLAUDE_BIN",
     shutil.which("claude") or str(Path("~/.local/bin/claude").expanduser()))
 CODEX_BIN = os.environ.get("CODEX_BIN", _resolve_codex_bin())
-CODEX_MODEL = os.environ.get("CODEX_MODEL", "gpt-5.4")
+CODEX_MODEL = os.environ.get("CODEX_MODEL", "gpt-5.5")
+CODEX_EFFORT = os.environ.get("CODEX_EFFORT", "xhigh")
 # OpenCode CLI — additional fallback provider.
 OPENCODE_BIN = os.environ.get("OPENCODE_BIN", shutil.which("opencode") or "opencode")
 OPENCODE_MODEL = os.environ.get("OPENCODE_MODEL", "")  # e.g. "anthropic/claude-sonnet-4-5"
 CLAUDE_LIMIT_COOLDOWN = int(os.environ.get("CLAUDE_LIMIT_COOLDOWN", str(6 * 60 * 60)))
 # Provider priority — comma-separated list of providers to try in order.
 # Available: "claude", "codex", "opencode". First available provider is used as primary.
-# Example: PROVIDER_ORDER=opencode,codex  (skip Claude, use OpenCode first)
-PROVIDER_ORDER = [p.strip() for p in os.environ.get("PROVIDER_ORDER", "claude,codex,opencode").split(",") if p.strip()]
+# Default: codex primary, claude as fallback (Claude CLI -p flag removal on the
+# subscription tier made codex more reliable for this project).
+# Example: PROVIDER_ORDER=claude,codex  (legacy ordering, claude first)
+PROVIDER_ORDER = [p.strip() for p in os.environ.get("PROVIDER_ORDER", "codex,claude,opencode").split(",") if p.strip()]
 if not PROVIDER_ORDER:
-    PROVIDER_ORDER = ["claude", "codex", "opencode"]
-    print("WARNING: PROVIDER_ORDER was empty — falling back to default: claude,codex,opencode", file=sys.stderr)
+    PROVIDER_ORDER = ["codex", "claude", "opencode"]
+    print("WARNING: PROVIDER_ORDER was empty — falling back to default: codex,claude,opencode", file=sys.stderr)
 TELEGRAM_CLIENT_SCRIPT = Path(
     "~/.claude/plugins/cache/local/telegram-explorer/1.0.0/skills/"
     "telegram-explorer/scripts/telegram_client.py"
 ).expanduser()
 TELEGRAM_CLIENT_PYTHON = TELEGRAM_CLIENT_SCRIPT.parent / ".venv/bin/python3"
 TWITTER_FETCH_SCRIPT = Path(
-    "~/.claude/plugins/cache/local/twitter-explorer/1.0.0/skills/"
+    "~/.claude/plugins/cache/local/twitter-explorer/1.1.0/skills/"
     "twitter-explorer/scripts/twitter_fetch.py"
 ).expanduser()
 HEADLINE_VALIDATOR = BASE_DIR / "skills/leviathan-headlines/scripts/validate-headline.sh"
@@ -364,8 +367,15 @@ class AgentDB:
             username TEXT PRIMARY KEY,
             numeric_id INTEGER NOT NULL,
             title TEXT,
+            channel_type TEXT DEFAULT 'channel',
             resolved_at TEXT NOT NULL
         )""")
+        # Migration: add channel_type column if missing. No DEFAULT on ALTER so
+        # existing rows stay NULL — the one-time migration in run_agent() detects
+        # and classifies them. CREATE TABLE above uses DEFAULT 'channel' for fresh DBs.
+        cols = [r[1] for r in c.execute("PRAGMA table_info(channel_ids)").fetchall()]
+        if "channel_type" not in cols:
+            c.execute("ALTER TABLE channel_ids ADD COLUMN channel_type TEXT")
 
         # Every message the agent has seen and evaluated
         c.execute("""CREATE TABLE IF NOT EXISTS evaluated_messages (
@@ -461,11 +471,28 @@ class AgentDB:
         ).fetchone()
         return row["numeric_id"] if row else None
 
-    def save_channel_id(self, username: str, numeric_id: int, title: str = None):
+    def get_channel_type(self, username: str) -> str:
+        """Return 'group' or 'channel' for a cached channel. Defaults to 'channel'."""
+        row = self._execute(
+            "SELECT channel_type FROM channel_ids WHERE username = ?", (username,)
+        ).fetchone()
+        return row["channel_type"] if row and row["channel_type"] else "channel"
+
+    def get_untyped_channels(self) -> list[dict]:
+        """Return cached channels that haven't been classified yet (NULL channel_type).
+        The ALTER migration omits DEFAULT so existing rows are genuinely NULL.
+        After the one-time migration classifies them, no NULL rows remain."""
+        rows = self._execute(
+            "SELECT username, numeric_id, title FROM channel_ids WHERE channel_type IS NULL"
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def save_channel_id(self, username: str, numeric_id: int, title: str = None,
+                        channel_type: str = "channel"):
         now = datetime.now(timezone.utc).isoformat()
         self._execute(
-            "INSERT OR REPLACE INTO channel_ids (username, numeric_id, title, resolved_at) VALUES (?, ?, ?, ?)",
-            (username, numeric_id, title, now),
+            "INSERT OR REPLACE INTO channel_ids (username, numeric_id, title, channel_type, resolved_at) VALUES (?, ?, ?, ?, ?)",
+            (username, numeric_id, title, channel_type, now),
         )
         self._commit()
 
@@ -789,53 +816,9 @@ class LNClient:
             else:
                 log.error(f"Comment failed on {content_id}: {r.status_code} {r.text[:200]}")
 
-# ─── LLM CLI Providers ──────────────────────────────────────────────────────
+# ─── LLM CLI Providers (chain driven by PROVIDER_ORDER env) ─────────────────
 
-# Circuit breaker: if Claude CLI fails N times in a row, or hits a quota error,
-# stop using it temporarily and fall back to Codex for the current workload.
-_claude_failures = 0
-_claude_max_failures = 3
-_claude_unavailable_until = 0.0
-_claude_failures_lock = threading.Lock()
-
-
-def _build_provider_env(bin_path: str) -> dict:
-    """Ensure the provider binary's directory is on PATH for subprocess execution."""
-    parent = str(Path(bin_path).expanduser().parent)
-    return {**os.environ, "PATH": f"{parent}:{os.environ.get('PATH', '')}"}
-
-
-def _looks_like_claude_limit_error(stdout: str, stderr: str) -> bool:
-    """Detect quota/rate-limit style failures that should trip long Claude cooldown."""
-    combined = f"{stdout}\n{stderr}".lower()
-    patterns = [
-        "status code 501", "http 501", "error 501",
-        "usage limit", "monthly usage", "quota", "credit balance",
-        "rate limit", "too many requests", "exhausted",
-        "payment required", "billing", "overloaded",
-        "hit your limit",
-    ]
-    return any(p in combined for p in patterns)
-
-
-def _mark_claude_unavailable(reason: str, cooldown: int = CLAUDE_LIMIT_COOLDOWN):
-    """Open the Claude breaker for a longer window when limits are hit."""
-    global _claude_failures, _claude_unavailable_until
-    until = time.time() + max(60, cooldown)
-    with _claude_failures_lock:
-        _claude_failures = _claude_max_failures
-        _claude_unavailable_until = max(_claude_unavailable_until, until)
-    log.warning(
-        f"Claude marked unavailable for {int(max(60, cooldown))}s: {reason[:200]}"
-    )
-
-
-def _claude_is_available() -> bool:
-    """Return whether Claude should be attempted right now."""
-    with _claude_failures_lock:
-        if _claude_unavailable_until > time.time():
-            return False
-        return _claude_failures < _claude_max_failures
+from providers import ClaudeProvider, CodexProvider, OpenCodeProvider, ProviderChain
 
 
 def _build_codex_prompt(prompt: str) -> str:
@@ -845,239 +828,73 @@ def _build_codex_prompt(prompt: str) -> str:
         TELEGRAM_CLIENT_PYTHON=TELEGRAM_CLIENT_PYTHON,
         TELEGRAM_CLIENT_SCRIPT=TELEGRAM_CLIENT_SCRIPT,
         HEADLINE_VALIDATOR=HEADLINE_VALIDATOR,
-        BOT_HQ=BOT_HQ,
+        BOT_HQ_ID=BOT_HQ if BOT_HQ is not None else "(unset)",
         prompt=prompt)
 
 
-def _claude_ask_sync(prompt: str, timeout: int = 3600, retries: int = 2,
-                     model: str | None = None, effort: str = "max",
-                     allowed_tools: str | None = None) -> str:
-    """Blocking Claude CLI call with retry and quota-aware circuit breaker.
-    allowed_tools: override CLAUDE_ALLOWED_TOOLS. Pass "" for no tools."""
-    global _claude_failures
-
-    for attempt in range(retries + 1):
-        # Check circuit breaker / quota cooldown before attempting Claude
-        with _claude_failures_lock:
-            cooldown_remaining = max(0, int(_claude_unavailable_until - time.time()))
-            failure_count = _claude_failures
-        if cooldown_remaining > 0:
-            log.warning(
-                f"Claude cooldown active ({cooldown_remaining}s remaining) — skipping primary provider"
-            )
-            return ""
-        if failure_count >= _claude_max_failures:
-            log.warning("Claude CLI circuit breaker open — skipping primary provider")
-            return ""
-
-        try:
-            tools = allowed_tools if allowed_tools is not None else CLAUDE_ALLOWED_TOOLS
-            # Use a sentinel that matches no real tool when we want zero tool access.
-            # Empty string and omitting the flag both grant ALL tools in Claude CLI.
-            if tools == "":
-                tools = "__none__"
-            command = [
-                CLAUDE_BIN, "-p", "-",
-                "--effort", effort,
-                "--allowedTools", tools,
-            ]
-            if model:
-                command.extend(["--model", model])
-            result = subprocess.run(
-                command,
-                input=prompt,
-                capture_output=True,
-                text=True,
-                timeout=timeout,
-                env=_build_provider_env(CLAUDE_BIN),
-                cwd=str(BASE_DIR),
-            )
-            response = result.stdout.strip()
-            stderr_out = result.stderr.strip() if result.stderr else ""
-            combined = f"{response}\n{stderr_out}".strip()
-            response_lower = response.lower()
-            combined_lower = combined.lower()
-            if (
-                result.returncode != 0
-                or not response
-                or response.startswith("Error:")
-                or response == "Execution error"
-                or "max turns" in response_lower
-                or "max turns" in combined_lower
-            ):
-                log.warning(f"Claude returned error (attempt {attempt+1}/{retries+1}): {combined[:200]}")
-                if stderr_out:
-                    log.warning(f"Claude stderr: {stderr_out[:500]}")
-                if _looks_like_claude_limit_error(response, stderr_out):
-                    _mark_claude_unavailable(
-                        combined or "quota/limit failure",
-                        cooldown=CLAUDE_LIMIT_COOLDOWN,
-                    )
-                    return ""
-                if attempt < retries:
-                    time.sleep(5 * (attempt + 1))  # backoff: 5s, 10s
-                    continue
-                # Final attempt failed — increment circuit breaker
-                with _claude_failures_lock:
-                    _claude_failures += 1
-                return ""
-
-            # Success — reset circuit breaker
-            with _claude_failures_lock:
-                _claude_failures = 0
-            return response
-
-        except subprocess.TimeoutExpired:
-            log.error(f"Claude CLI timed out (attempt {attempt+1}/{retries+1})")
-            if attempt < retries:
-                time.sleep(5 * (attempt + 1))
-                continue
-            with _claude_failures_lock:
-                _claude_failures += 1
-            return ""
-        except Exception as e:
-            log.error(f"Claude CLI error (attempt {attempt+1}/{retries+1}): {e}")
-            if attempt < retries:
-                time.sleep(5 * (attempt + 1))
-                continue
-            with _claude_failures_lock:
-                _claude_failures += 1
-            return ""
-
-    return ""  # Should not reach here
+_claude_provider = ClaudeProvider(
+    bin=CLAUDE_BIN,
+    default_effort="max",
+    default_tools=CLAUDE_ALLOWED_TOOLS,
+    cwd=str(BASE_DIR),
+    quota_cooldown=CLAUDE_LIMIT_COOLDOWN,
+)
+_codex_provider = CodexProvider(
+    bin=CODEX_BIN,
+    model=CODEX_MODEL,
+    effort=CODEX_EFFORT,
+    cwd=str(BASE_DIR),
+    sandbox_bypass=True,
+    add_dirs=["~/.claude"],
+    wrapper=_build_codex_prompt,
+)
+_opencode_provider = OpenCodeProvider(
+    bin=OPENCODE_BIN,
+    model=OPENCODE_MODEL,
+    cwd=str(BASE_DIR),
+    wrapper=_build_codex_prompt,
+)
+_provider_chain = ProviderChain.from_env_order(
+    "PROVIDER_ORDER", default="codex,claude,opencode",
+    providers={
+        "claude": _claude_provider,
+        "codex": _codex_provider,
+        "opencode": _opencode_provider,
+    },
+)
+log.info(f"LLM provider chain: {','.join(_provider_chain.names())}")
 
 
-def _codex_ask_sync(prompt: str, timeout: int = 3600) -> str:
-    """Blocking Codex CLI call used when Claude is unavailable or fails."""
-    wrapped_prompt = _build_codex_prompt(prompt)
-    output_path = None
-    try:
-        with tempfile.NamedTemporaryFile(prefix="ln-codex-", suffix=".txt", delete=False) as tmp:
-            output_path = tmp.name
-
-        result = subprocess.run(
-            [
-                CODEX_BIN, "exec",
-                "--skip-git-repo-check",
-                "--ephemeral",
-                "--dangerously-bypass-approvals-and-sandbox",
-                "--add-dir", str(Path("~/.claude").expanduser()),
-                "-C", str(BASE_DIR),
-                "-m", CODEX_MODEL,
-                "-o", output_path,
-                "-",
-            ],
-            input=wrapped_prompt,
-            capture_output=True,
-            text=True,
-            timeout=timeout,
-            env=_build_provider_env(CODEX_BIN),
-            cwd=str(BASE_DIR),
-        )
-        stdout_out = result.stdout.strip() if result.stdout else ""
-        stderr_out = result.stderr.strip() if result.stderr else ""
-        response = ""
-        if output_path and Path(output_path).exists():
-            response = Path(output_path).read_text().strip()
-        if not response and stdout_out:
-            response = stdout_out.strip()
-        if result.returncode != 0 or not response:
-            log.error(f"Codex fallback failed: {(stderr_out or stdout_out)[:500]}")
-            return ""
-        return response
-    except subprocess.TimeoutExpired:
-        log.error("Codex fallback timed out")
-        return ""
-    except Exception as e:
-        log.error(f"Codex fallback error: {e}")
-        return ""
-    finally:
-        if output_path:
-            try:
-                Path(output_path).unlink(missing_ok=True)
-            except Exception:
-                pass
 
 
-def _opencode_ask_sync(prompt: str, timeout: int = 3600) -> str:
-    """Blocking OpenCode CLI call used when both Claude and Codex are unavailable.
-    Uses `opencode run` in non-interactive mode."""
-    if not OPENCODE_MODEL:
-        return ""  # OpenCode not configured — skip silently
-    wrapped = _build_codex_prompt(prompt)  # same wrapper works — generic fallback instructions
-    try:
-        cmd = [OPENCODE_BIN, "run", "--model", OPENCODE_MODEL]
-        result = subprocess.run(
-            cmd,
-            input=wrapped,
-            capture_output=True,
-            text=True,
-            timeout=timeout,
-            env=_build_provider_env(OPENCODE_BIN),
-            cwd=str(BASE_DIR),
-        )
-        response = result.stdout.strip()
-        if result.returncode != 0 or not response:
-            log.error(f"OpenCode fallback failed: {(result.stderr or result.stdout or '')[:500]}")
-            return ""
-        return response
-    except subprocess.TimeoutExpired:
-        log.error("OpenCode fallback timed out")
-        return ""
-    except FileNotFoundError:
-        log.debug("OpenCode binary not found — skipping")
-        return ""
-    except Exception as e:
-        log.error(f"OpenCode fallback error: {e}")
-        return ""
+def llm_ask(prompt: str, timeout: int = 3600,
+            tier: str | None = None,
+            model: str | None = None, effort: str | None = None,
+            skip_soul: bool = False, tools: str | None = None) -> str:
+    """Dispatch to the configured provider chain.
 
+    tier: semantic tier label ("classification" or "creative"). Each provider
+    maps this to its own model/effort defaults. Use tier='classification' for
+    cheap, fast calls (votes, freshness checks, dedup, sentinel) — works
+    regardless of which provider is primary in the chain.
 
-def llm_ask(prompt: str, timeout: int = 3600, claude_model: str | None = None,
-            claude_effort: str = "max", skip_soul: bool = False,
-            allowed_tools: str | None = None) -> str:
-    """Try providers in PROVIDER_ORDER until one succeeds.
-    skip_soul: skip the ~1500-token soul prepend for classification tasks
-    where personality/tone is irrelevant (votes, freshness checks, dedup).
-    allowed_tools: override tool allowlist. Pass "" for no tools."""
-    # Strip unpaired surrogates from the full prompt — they cause Claude API JSON parse errors
-    prompt = prompt.encode('utf-8', errors='surrogatepass').decode('utf-8', errors='ignore')
-    # Prepend soul to creative/conversational prompts — skip for classification
+    model / effort: explicit per-call overrides — beat the tier preset. Use
+    only when you need a specific provider's model/effort that the tier
+    abstraction can't express.
+
+    tools: per-call tool allowlist (Claude-specific). Codex sandbox bypass and
+    OpenCode's tool model are not affected by this kwarg.
+
+    skip_soul: omit the ~1500-token soul prepend on classification tasks where
+    tone/personality is irrelevant."""
     if AGENT_SOUL and not skip_soul:
         prompt = f"{AGENT_SOUL}\n\n{prompt}"
-    attempted = False  # track whether a previous provider was actually tried
-    for provider in PROVIDER_ORDER:
-        if provider == "claude":
-            if not _claude_is_available():
-                continue
-            if attempted:
-                log.warning(f"Falling back to {provider} for LLM request")
-            attempted = True
-            result = _claude_ask_sync(
-                prompt, timeout=timeout, model=claude_model,
-                effort=claude_effort, allowed_tools=allowed_tools,
-            )
-        elif provider == "codex":
-            if attempted:
-                log.warning(f"Falling back to {provider} for LLM request")
-            attempted = True
-            result = _codex_ask_sync(prompt, timeout=timeout)
-        elif provider == "opencode":
-            if not OPENCODE_MODEL:
-                continue  # unconfigured — skip without logging fallback
-            if attempted:
-                log.warning(f"Falling back to {provider} for LLM request")
-            attempted = True
-            result = _opencode_ask_sync(prompt, timeout=timeout)
-        else:
-            log.warning(f"Unknown provider '{provider}' in PROVIDER_ORDER — skipping")
-            continue
-        if result:
-            return result
-    return ""
+    return _provider_chain.ask(prompt, timeout=timeout,
+                                tier=tier, model=model, effort=effort, tools=tools)
 
 
 def claude_ask(prompt: str, timeout: int = 3600) -> str:
-    """Backward-compatible wrapper for existing call sites; now uses Codex fallback."""
+    """Backward-compatible wrapper for existing call sites."""
     return llm_ask(prompt, timeout)
 
 
@@ -1110,10 +927,9 @@ def _sentinel_check_sync(text: str, context: str, timeout: int = 120) -> bool:
         raw = llm_ask(
             prompt,
             timeout=timeout,
-            claude_model="sonnet",
-            claude_effort="low",
+            tier="classification",
             skip_soul=True,
-            allowed_tools="",
+            tools="",
         )
         response = raw.strip().lower() if raw else ""
         # Exact first-word match to avoid "not unsafe" false triggers
@@ -1133,23 +949,48 @@ def _sentinel_check_sync(text: str, context: str, timeout: int = 120) -> bool:
 
 # ─── AI Evaluation Functions ────────────────────────────────────────────────
 
-def _pre_filter_message(text: str) -> bool:
+def _pre_filter_message(text: str, is_group: bool = False) -> bool:
     """Fast keyword pre-filter — returns True if the message might be newsworthy
     and should be sent to the LLM for full evaluation. Returns False for obvious
     noise that can be dropped without burning tokens.
 
-    Three-pass approach:
-    1. Check for signal keywords and news URLs
-    2. Check for noise patterns — but signal overrides noise (if both present, let LLM decide)
-    3. Require at least one signal to pass
+    Both channels and groups filter ambient messages. The core rule: messages need
+    a URL to pass. Channels also share news as text-only alerts (no link), so they
+    get a fallback: text-only messages pass if they have hard breaking-news indicators
+    AND no noise patterns. Groups don't get this fallback — no URL = ambient chat.
+
+    URL detection includes http(s) links (including t.me/ for cross-channel sharing)
+    and bare domains with a path (e.g. coindesk.com/article/...).
 
     Targets significant volume reduction without dropping real news.
     """
     if not text or len(text) < 15:
         return False
+
+    # ── URL detection (shared across all source types) ───────────────────────
+    has_any_url = bool(re.search(r'https?://\S+', text))
+    has_bare_url = bool(re.search(
+        r'(?<!\S)\w+\.(?:com|org|net|io|xyz|co|me|news|info|dev|app|finance|exchange)/\S*',
+        text, re.IGNORECASE
+    ))
+    has_url = has_any_url or has_bare_url
+
+    # Any message with a URL passes — it's sharing content worth evaluating
+    if has_url:
+        return True
+
+    # Groups: no URL = ambient chat, always drop
+    if is_group:
+        return False
+
+    # ── Channels: text-only messages need hard breaking-news indicators ──────
+    # Generic signal keywords like "launch", "fund", "partnership" appear in
+    # commentary ("bullish on this launch", "massive partnership"). Only let
+    # text-only messages through if they have strong news-specific indicators
+    # that rarely appear in casual commentary.
     text_lower = text.lower()
 
-    # ── Noise patterns (positions, price ticks, promos, bot commands) ────────
+    # Noise patterns — if present, this is not a breaking news alert
     noise_patterns = [
         # Trading positions / portfolio trackers
         "was liquidated", "got liquidated", "liq price", "entry price", "take profit", "stop loss",
@@ -1174,45 +1015,44 @@ def _pre_filter_message(text: str) -> bool:
         # Social engagement bait
         "like and retweet", "follow for more", "thread 🧵",
     ]
-
-    # ── Signal keywords ──────────────────────────────────────────────────────
-    signal_keywords = [
-        # Protocol / project activity
-        "launch", "deploy", "upgrade", "migrate", "fork", "merge",
-        "mainnet", "testnet", "shipped", "release",
-        # Security
-        "exploit", "hack", "vulnerability", "patch", "audit",
-        "compromised", "drained", "stolen", "breach", "rug pull",
-        "incident", "postmortem", "post-mortem",
-        # Financial
-        "million", "billion", "fund", "raise", "invest",
-        "acquisition", "partnership", "ipo", "listing", "delist",
-        "revenue", "profit", "earnings", "valuation",
-        # Regulatory
-        "sec ", "cftc", "regulation", "compliance", "sanction",
-        "lawsuit", "enforcement", "subpoena", "indictment",
-        "bill ", "framework", "license", "approved", "denied",
-        # Governance
-        "proposal", "governance", "dao", "treasury", "snapshot",
-        # News indicators
-        "breaking", "just in", "announces", "confirms", "reveals",
-        "report:", "according to", "sources say", "exclusive",
-        "filed", "settled", "convicted", "arrested",
-        # Personnel / leadership
-        "steps down", "resigns", "appoints", "ceo", "cto",
-        # Market events
-        "all-time high", "depeg", "collapses", "insolvent", "bankrupt",
-        "halt", "outage", "airdrop",
-    ]
-
-    has_news_url = bool(re.search(r'https?://(?!t\.me/)\S+', text))
-    has_signal = has_news_url or any(k in text_lower for k in signal_keywords)
-    has_noise = any(p in text_lower for p in noise_patterns)
-
-    # Signal overrides noise — if both present, let the LLM decide
-    if has_noise and not has_signal:
+    if any(p in text_lower for p in noise_patterns):
         return False
-    return has_signal
+
+    # Hard breaking-news indicators — specific enough to not appear in commentary.
+    # Uses verb stems where safe (announce→announces/announced/announcing) but keeps
+    # conjugated forms where the stem is a commentary magnet (e.g. "launch" excluded
+    # because "bullish on this launch" is commentary, but "launched"/"launches" kept).
+    breaking_signals = [
+        # Breaking news markers
+        "breaking", "just in", "exclusive", "alert:",
+        # Active news verbs — stems match all inflections via substring
+        "announc", "confirm", "reveal", "deploy",   # announces/announced/announcing etc.
+        "approv", "reject", "collaps",               # approves/approved/collapses/collapsed
+        "denied", "denies",                           # "deny" stem too short, explicit forms
+        "launched", "launches",                       # stem "launch" too broad (commentary)
+        "acqui", "merger",                            # acquires/acquired/acquisition
+        "files ", "signs ", "raises ",               # "files for", "signs bill", "raises $X"
+        "loses ", "sells ",                           # "loses $70m", "sells stake"
+        # Technical milestones (not commentary vocabulary)
+        "mainnet", "testnet",
+        # Security events (concrete incidents, not discussion about security)
+        "exploit", "hack", "drained", "compromised", "stolen", "breach",
+        "rug pull", "vulnerability",
+        # Legal / regulatory
+        "filed", "arrested", "convicted", "settled", "indictment",
+        "subpoena", "enforcement action", "sentence",
+        "sec ", "cftc",  # regulatory body names (trailing space avoids "section")
+        # Exchange actions
+        "listing", "delist",
+        # Major market events
+        "insolvent", "bankrupt", "depeg", "halt",
+        "all-time high", "outage",
+        # Personnel moves
+        "steps down", "resigns", "appoints",
+        # Sourced reporting
+        "according to", "sources say", "report:",
+    ]
+    return any(k in text_lower for k in breaking_signals)
 
 
 def evaluate_and_deduplicate(messages: list[dict], db: AgentDB) -> list[dict]:
@@ -1225,11 +1065,16 @@ def evaluate_and_deduplicate(messages: list[dict], db: AgentDB) -> list[dict]:
         return []
 
     # Pre-filter: drop obvious noise before it hits the LLM
+    # Group messages get stricter filtering (URL required) to cut ambient chat
     original_count = len(messages)
-    messages = [m for m in messages if _pre_filter_message(m.get("text", ""))]
+    group_count = sum(1 for m in messages if m.get("is_group", False))
+    messages = [m for m in messages if _pre_filter_message(m.get("text", ""), is_group=m.get("is_group", False))]
     filtered_count = original_count - len(messages)
     if filtered_count:
-        log.info(f"Pre-filter dropped {filtered_count}/{original_count} noise messages")
+        group_remaining = sum(1 for m in messages if m.get("is_group", False))
+        group_dropped = group_count - group_remaining
+        log.info(f"Pre-filter dropped {filtered_count}/{original_count} noise messages "
+                 f"({group_dropped} ambient group, {filtered_count - group_dropped} channel noise)")
     if not messages:
         log.info(f"Pre-filter dropped all {original_count} messages — nothing to evaluate")
         return []
@@ -1488,8 +1333,7 @@ def evaluate_article_quality(headline: str, tags: list[str]) -> int:
         safe_headline=safe_headline, tags_str=tags_str)
 
     # Sonnet + low effort + no tools + no soul — trivial classification task
-    response = llm_ask(prompt, timeout=120, claude_model="sonnet",
-                       claude_effort="low", skip_soul=True, allowed_tools="")
+    response = llm_ask(prompt, timeout=120, tier="classification", skip_soul=True, tools="")
     if not response or not response.strip():
         return 0
     # Check for injection in the raw response before parsing — a manipulated model
@@ -1520,8 +1364,7 @@ def evaluate_comment_quality(comment_text: str, article_headline: str) -> int:
 
     # Sonnet + low effort + no tools + no soul — trivial classification task.
     # Output clamped to [-1, 1] so blast radius of any injection is minimal.
-    response = llm_ask(prompt, timeout=120, claude_model="sonnet",
-                       claude_effort="low", skip_soul=True, allowed_tools="")
+    response = llm_ask(prompt, timeout=120, tier="classification", skip_soul=True, tools="")
     if not response or not response.strip():
         return 0
     # Check for injection in the raw response before parsing
@@ -1588,8 +1431,7 @@ def batch_evaluate_articles(articles: list[dict]) -> dict[int, int]:
         batch_text=batch_text)
 
     # Sonnet + low effort + no tools + no soul — batch classification
-    response = llm_ask(prompt, timeout=180, claude_model="sonnet",
-                       claude_effort="low", skip_soul=True, allowed_tools="")
+    response = llm_ask(prompt, timeout=180, tier="classification", skip_soul=True, tools="")
     if not response or not response.strip():
         log.warning("Batch article vote returned empty — falling back to individual")
         return {}
@@ -1633,8 +1475,7 @@ def batch_evaluate_comments(comments: list[dict]) -> dict[int, int]:
     prompt = load_prompt("agent/batch_evaluate_comments",
         batch_text=batch_text)
 
-    response = llm_ask(prompt, timeout=180, claude_model="sonnet",
-                       claude_effort="low", skip_soul=True, allowed_tools="")
+    response = llm_ask(prompt, timeout=180, tier="classification", skip_soul=True, tools="")
     if not response or not response.strip():
         log.warning("Batch comment vote returned empty — falling back to individual")
         return {}
@@ -1671,9 +1512,8 @@ def check_article_freshness(url: str, message_text: str) -> bool:
 
     # Sonnet + low effort + no soul — binary classification (fresh/stale).
     # Still needs WebFetch to check the article's publication date.
-    response = llm_ask(prompt, timeout=120, claude_model="sonnet",
-                       claude_effort="low", skip_soul=True,
-                       allowed_tools="WebFetch")
+    response = llm_ask(prompt, timeout=120, tier="classification", skip_soul=True,
+                       tools="WebFetch")
     if not response or not response.strip():
         # The LLM returned nothing (timeout/error) — can't determine freshness.
         # Default to fresh (allow) since the article already passed evaluation and
@@ -1775,8 +1615,8 @@ def walk_replies_and_respond(yaps: list, our_yap_ids: set, our_yap_texts: dict,
                     safe_reply_text=safe_reply_text)
                 eval_result = llm_ask(
                     worth_prompt,
-                    timeout=120, claude_model="sonnet", claude_effort="low",
-                    skip_soul=True, allowed_tools="",
+                    timeout=120, tier="classification",
+                    skip_soul=True, tools="",
                 )
                 should_reply = eval_result.strip().lower().startswith("yes") if eval_result else False
 
@@ -1806,6 +1646,7 @@ async def resolve_channel(client: TelegramClient, channel: str, db: AgentDB):
     """
     Resolve a @username to a numeric ID, using DB cache first.
     Numeric IDs never trigger ResolveUsernameRequest — no flood waits.
+    Also detects and caches channel_type (group vs channel) for pre-filtering.
     """
     # Check DB cache first
     cached_id = db.get_channel_id(channel)
@@ -1816,15 +1657,17 @@ async def resolve_channel(client: TelegramClient, channel: str, db: AgentDB):
     entity = await client.get_entity(channel)
     numeric_id = entity.id
     title = getattr(entity, "title", channel)
-    db.save_channel_id(channel, numeric_id, title)
-    log.info(f"Resolved and cached {channel} → {numeric_id} ({title})")
+    # Detect entity type: megagroups are groups, broadcast channels are channels
+    channel_type = "group" if getattr(entity, "megagroup", False) else "channel"
+    db.save_channel_id(channel, numeric_id, title, channel_type)
+    log.info(f"Resolved and cached {channel} → {numeric_id} ({title}, {channel_type})")
     return numeric_id
 
 
 async def fetch_channel_messages(
     client: TelegramClient, channel, min_id: int = 0,
     limit: int = 50, since: datetime = None,
-    channel_name: str = None,
+    channel_name: str = None, is_group: bool = False,
 ) -> list[dict]:
     """Fetch new messages from a Telegram channel (using numeric ID to avoid flood waits)."""
     display_name = channel_name or (channel if isinstance(channel, str) else str(channel))
@@ -1839,6 +1682,7 @@ async def fetch_channel_messages(
                     "id": msg.id,
                     "text": msg.text,
                     "date": msg.date.isoformat(),
+                    "is_group": is_group,
                 })
     except FloodWaitError as e:
         log.warning(f"Flood wait on {display_name}: {e.seconds}s — skipping")
@@ -1849,14 +1693,95 @@ async def fetch_channel_messages(
 
 
 
+# Headline-bot user ID — the bot account that posts approved headlines in Bot HQ.
+# Set HEADLINE_BOT_USER_ID env to filter HQ messages to that bot's posts only.
+LNN_HEADLINE_BOT_ID = int(os.environ.get("HEADLINE_BOT_USER_ID", "0"))
+
+
+def fetch_bot_hq_recent_headlines(limit: int = 80, hours: int = 6) -> list[str] | None:
+    """Fetch recent headline-bot posts from Leviathan News Bot HQ.
+
+    Returns a deterministic list of recent HQ headlines (newest first) that the
+    dedup check compares the candidate against. Previously the dup check asked
+    Sonnet-with-tools to search Telegram itself, but that was unreliable —
+    Sonnet would sometimes skip the searches and guess based on the hint alone,
+    letting duplicates through (e.g. NY/IL prediction-market ban + GENIUS Act
+    extension were both posted minutes after matching HQ posts on 2026-04-22).
+    Doing the fetch in Python makes the check auditable and consistent.
+
+    Returns:
+        list[str] — headline strings (possibly empty if HQ genuinely had no
+                    matching posts in the window)
+        None    — fetch failed OR Bot HQ is not configured. Caller can
+                  distinguish "fetch broken" from "HQ quiet" and decide
+                  whether to fail open or hold posts.
+    """
+    if BOT_HQ is None:
+        # BOT_HQ_GROUP_ID env not set — operator opted out of HQ dedup.
+        return None
+    try:
+        result = subprocess.run(
+            [str(TELEGRAM_CLIENT_PYTHON), str(TELEGRAM_CLIENT_SCRIPT),
+             "messages", str(BOT_HQ), "--limit", str(limit)],
+            capture_output=True, text=True, timeout=60,
+            # Silence any spurious stdout leakage from library warnings that
+            # would otherwise break json.loads (e.g. DeprecationWarning in a
+            # future Telethon version printing to stdout during import).
+            env={**os.environ, "PYTHONWARNINGS": "ignore"},
+        )
+        if result.returncode != 0:
+            log.warning(f"Bot HQ fetch failed: rc={result.returncode} "
+                        f"stderr={result.stderr[:200]}")
+            return None
+        stdout = result.stdout
+        # Defensive: locate the first '[' and parse from there. Protects
+        # against any non-JSON prefix line that may leak onto stdout (e.g.
+        # a Python warning or Telethon log that bypasses PYTHONWARNINGS).
+        start = stdout.find("[")
+        if start > 0:
+            stdout = stdout[start:]
+        msgs = json.loads(stdout)
+    except (subprocess.TimeoutExpired, json.JSONDecodeError, OSError) as e:
+        log.warning(f"Bot HQ fetch exception: {e}")
+        return None
+
+    cutoff = datetime.now(timezone.utc) - timedelta(hours=hours)
+    headlines: list[str] = []
+    for m in msgs:
+        # If HEADLINE_BOT_USER_ID is unset (0), accept every sender; otherwise
+        # filter to the configured headline bot only.
+        if LNN_HEADLINE_BOT_ID and m.get("sender_id") != LNN_HEADLINE_BOT_ID:
+            continue
+        date_str = (m.get("date") or "").replace("Z", "+00:00")
+        try:
+            dt = datetime.fromisoformat(date_str)
+        except ValueError:
+            continue
+        if dt < cutoff:
+            continue
+        text = (m.get("text") or "").strip()
+        if not text:
+            continue
+        # Admin panel posts start with "**「" (ornamental heading) or contain
+        # "ADMIN PANEL" near the top — skip these, they aren't story headlines.
+        if text.startswith("**「") or "ADMIN PANEL" in text[:60]:
+            continue
+        # The first line is "<headline> [- Source](url)". Strip the markdown
+        # source link so we compare headline text only.
+        first_line = text.split("\n", 1)[0]
+        first_line = re.sub(r"\s*\[-[^\]]*\]\([^)]*\)\s*$", "", first_line).strip()
+        if first_line:
+            headlines.append(first_line)
+    return headlines
+
 
 # ─── Main Agent Loop ────────────────────────────────────────────────────────
 
 async def run_agent():
-    # Reset circuit breaker at start of each cycle
-    global _claude_failures
-    with _claude_failures_lock:
-        _claude_failures = 0
+    # Reset transient failure counts on every provider at cycle start so a
+    # previous cycle's hiccup doesn't keep a provider sidelined indefinitely.
+    # (Quota cooldowns are preserved — those represent real lockouts.)
+    _provider_chain.reset_failures()
 
     # Load credentials at runtime so errors get logged
     api_id, api_hash, wallet_key = load_credentials()
@@ -1886,6 +1811,33 @@ async def run_agent():
         await client.start()
         log.info("Telegram connected")
 
+        # One-time migration: detect group vs channel for all cached entries
+        # Uses numeric IDs (no flood wait risk). Runs once — after all channels
+        # are typed, get_untyped_channels() returns empty and this block is a no-op.
+        untyped = db.get_untyped_channels()
+        if untyped:
+            log.info(f"Detecting channel types for {len(untyped)} cached channels...")
+            n_groups = 0
+            n_channels = 0
+            n_failed = 0
+            for entry in untyped:
+                try:
+                    entity = await client.get_entity(entry["numeric_id"])
+                    ctype = "group" if getattr(entity, "megagroup", False) else "channel"
+                    db.save_channel_id(entry["username"], entry["numeric_id"],
+                                       entry["title"], ctype)
+                    if ctype == "group":
+                        n_groups += 1
+                        log.info(f"  {entry['username']}: detected as group")
+                    else:
+                        n_channels += 1
+                except Exception as e:
+                    n_failed += 1
+                    log.warning(f"  {entry['username']}: type detection failed — {e}")
+                await asyncio.sleep(0.3)
+            log.info(f"Migration complete: {n_groups} groups, {n_channels} channels, "
+                     f"{n_failed} failed")
+
         all_messages = []
         for channel in CHANNELS:
             # Resolve @username → numeric ID via DB cache (no API call if cached)
@@ -1899,7 +1851,9 @@ async def run_agent():
                 continue
 
             last_id = db.get_cursor(channel)
-            msgs = await fetch_channel_messages(client, numeric_id, min_id=last_id, limit=50, since=since, channel_name=channel)
+            # Look up entity type to tag group messages for stricter pre-filtering
+            is_group = db.get_channel_type(channel) == "group"
+            msgs = await fetch_channel_messages(client, numeric_id, min_id=last_id, limit=50, since=since, channel_name=channel, is_group=is_group)
             if msgs:
                 log.info(f"  {channel}: {len(msgs)} new")
                 all_messages.extend(msgs)
@@ -1911,7 +1865,8 @@ async def run_agent():
             async for dialog in client.iter_dialogs():
                 if dialog.name in PRIVATE_CHANNELS:
                     last_id = db.get_cursor(dialog.name)
-                    msgs = await fetch_channel_messages(client, dialog.entity, min_id=last_id, limit=50, since=since)
+                    is_group = getattr(dialog.entity, "megagroup", False)
+                    msgs = await fetch_channel_messages(client, dialog.entity, min_id=last_id, limit=50, since=since, is_group=is_group)
                     if msgs:
                         for m in msgs:
                             m["channel"] = dialog.name
@@ -1921,7 +1876,9 @@ async def run_agent():
             log.warning(f"Private channel scan failed: {e}")
 
         active = len(set(m["channel"] for m in all_messages))
-        log.info(f"Scanned {len(CHANNELS)} channels, {active} had new messages, {len(all_messages)} total")
+        group_msgs = sum(1 for m in all_messages if m.get("is_group", False))
+        log.info(f"Scanned {len(CHANNELS)} channels, {active} had new messages, "
+                 f"{len(all_messages)} total ({group_msgs} from groups)")
 
         if not all_messages:
             log.info("Nothing new — exiting")
@@ -1935,6 +1892,22 @@ async def run_agent():
 
         ln = LNClient(wallet_key)
         ln.authenticate()
+
+        # Fetch Bot HQ recent headlines ONCE per cycle. Feeding this list into the
+        # dup check (below) is more reliable than asking Sonnet-with-tools to search
+        # Telegram itself — the latter skipped searches under load and let semantic
+        # duplicates through.
+        hq_dedup_hours = 6
+        hq_fetch = fetch_bot_hq_recent_headlines(limit=80, hours=hq_dedup_hours)
+        if hq_fetch is None:
+            # Fetch failed — distinct from "HQ quiet". Log loudly so monitors can alert.
+            hq_recent_headlines: list[str] = []
+            log.warning(f"Bot HQ fetch FAILED — dedup will fail open for this cycle "
+                        f"(last {hq_dedup_hours}h window)")
+        else:
+            hq_recent_headlines = hq_fetch
+            log.info(f"Bot HQ dedup context: {len(hq_recent_headlines)} recent headlines "
+                     f"(last {hq_dedup_hours}h)")
 
         # Process articles in parallel — each runs in its own thread
         def process_article_sync(item):
@@ -1955,32 +1928,43 @@ async def run_agent():
                                source_channel=item.get("channel"))
                 return False
 
-            # Check Bot HQ for duplicate via the provider layer + Telegram tooling
-            # hint comes from Claude's earlier evaluation of Telegram messages — second-order
-            # injection risk if a crafted Telegram message influenced the headline_hint output
+            # Bot HQ dup check — Sonnet classifies the candidate against a deterministic
+            # list of recent HQ headlines fetched up front. No Telegram tool access: the
+            # search is already done, we just need the semantic "same event?" judgment.
+            # Headlines and hint are wrapped with sanitize_untrusted for injection defense
+            # (headlines are bot-generated but pass through untrusted user submissions).
             safe_hint = sanitize_untrusted(hint, max_len=200) if hint else ""
-            # Sonnet + low effort + no soul — binary classification (dup/not_dup).
-            # Only needs Telegram search tool, not the full allowlist.
-            _dup_tools = f"Bash({TELEGRAM_CLIENT_PYTHON} {TELEGRAM_CLIENT_SCRIPT} messages*),Bash({TELEGRAM_CLIENT_PYTHON} {TELEGRAM_CLIENT_SCRIPT} search-global*)"
-            dup_prompt = load_prompt("agent/duplicate_check",
-                BOT_HQ=BOT_HQ, url=url, safe_hint=safe_hint)
-            dup_result = llm_ask(
-                dup_prompt,
-                timeout=300, claude_model="sonnet", claude_effort="low",
-                skip_soul=True, allowed_tools=_dup_tools,
-            )
-            # Check for injection in the raw response
-            if check_output_for_injection(dup_result, context="bot_hq_dup_check"):
-                log.warning(f"Injection detected in dup check response — rejecting article")
-                return False
-            # Fail closed: if response is empty/garbage (potential injection), treat as duplicate (reject)
-            # Only "not_duplicate" explicitly allows the article through
-            dup_lower = dup_result.strip().lower() if dup_result and dup_result.strip() else "duplicate"
-            if "not_duplicate" not in dup_lower:
-                log.info(f"Duplicate checker confirmed duplicate in Bot HQ: {hint}")
-                if hint:
-                    db.save_posted(url=url, headline="[duplicate in HQ]", story_hint=hint, source_channel=item.get("channel"))
-                return False
+            if not hq_recent_headlines:
+                log.warning(f"Bot HQ dedup context empty — proceeding without HQ check: {url}")
+            elif not safe_hint:
+                # Upstream evaluator didn't produce a headline_hint. HQ dedup relies on
+                # having a topic to match — log so the failure is visible and proceed.
+                log.warning(f"No headline_hint on candidate — skipping HQ dup check: {url}")
+            else:
+                hq_formatted = "\n".join(
+                    f"{i+1}. {sanitize_untrusted(h, max_len=300)}"
+                    for i, h in enumerate(hq_recent_headlines)
+                )
+                safe_url = sanitize_untrusted(url, max_len=500)
+                dup_prompt = load_prompt("agent/duplicate_check",
+                    candidate_hint=safe_hint, url=safe_url,
+                    hq_headlines=hq_formatted, hours=hq_dedup_hours)
+                dup_result = llm_ask(
+                    dup_prompt,
+                    timeout=120, tier="classification",
+                    skip_soul=True, tools="",
+                )
+                if check_output_for_injection(dup_result, context="bot_hq_dup_check"):
+                    log.warning(f"Injection detected in dup check response — rejecting article")
+                    return False
+                # Fail closed: empty/garbage response → treat as duplicate (reject).
+                # Only "not_duplicate" explicitly allows the article through.
+                dup_lower = dup_result.strip().lower() if dup_result and dup_result.strip() else "duplicate"
+                if "not_duplicate" not in dup_lower:
+                    log.info(f"Bot HQ dup check rejected: {hint}")
+                    db.save_posted(url=url, headline="[duplicate in HQ]", story_hint=hint,
+                                   source_channel=item.get("channel"))
+                    return False
 
             # Freshness check (runs against original URL — WebFetch follows redirects
             # so shortlinks/aggregators still resolve to the actual article for date checking)

@@ -6,24 +6,33 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 This is the **Leviathan News (LN)** workspace — a white-label crypto/DeFi news agent system. Fork it, set `AGENT_NAME`, and run your own instance.
 
-1. **`ln-agent.py`** — Automated news agent. Monitors Telegram channels (configured via `CHANNELS` env var), evaluates newsworthiness via Claude CLI (Codex fallback), deduplicates (including self-dedup via `was_story_posted()`), crafts headlines, posts via LN API. Also votes and writes TL;DR comments.
+1. **`ln-agent.py`** — Automated news agent. Monitors Telegram channels (configured via `CHANNELS` env var), evaluates newsworthiness via the provider chain (`providers.py` — Codex primary, Claude fallback by default), deduplicates (URL dedup + self-dedup via `was_story_posted()` + Bot HQ dedup against the headline-bot feed), crafts headlines, posts via LN API. Also votes and writes TL;DR comments.
 
 2. **`benthic-bot.py`** — Telegram chat bot sharing brain/identity with ln-agent. Responds in groups and operator DMs. Features: per-chat memory isolation, tiered operator auth, [GROUP] directive routing, agent-chat API polling, message debouncing, media analysis, persistent memory, self-awareness tracking.
 
-3. **`prompt_loader.py`** — Shared prompt template loader. Reads `.md` files from `prompts/`, caches in-memory, fills `{placeholders}` via `str.format()`. Used by both agent scripts.
+3. **`benthic-builder.py`** *(optional daemon)* — Codex-powered build queue. Consumes `build_tasks` rows from the shared SQLite, spawns Codex in a per-task workdir with full filesystem + network access, and pushes the result as a public repo under `BUILD_GITHUB_ORG` via `github_client.sh repo push`. Each task is isolated, time-capped at 6h, and reports back to the originating Telegram chat.
 
-4. **`prompts/`** — External prompt template directory. All LLM prompts extracted from the agent files for dev-time context savings and clean separation. Subdirs: `agent/` (14 templates), `bot/` (10 templates + `knowledge/` with 15 topic files).
+4. **`providers.py`** — Provider-agnostic LLM dispatch layer. Defines `ClaudeProvider` / `CodexProvider` / `OpenCodeProvider` (each with its own `CircuitBreaker` + tier table) and `ProviderChain` (ordered fallback, env-driven via `PROVIDER_ORDER`). All three runtime components import from here; swapping the "primary brain" is a single env var change, no code edits.
 
-5. **`github_client.sh`** — Write-only GitHub client wrapper. Enforces repo allowlist (`~/.claude/.github-repos-allowlist`), rate limits non-operators (3/day), adds attribution footer. Supports: `issue create|close|comment`, `pr create|comment`, `allowlist add|list`. Token loaded from `~/.claude/.github-token`.
+5. **`prompt_loader.py`** — Shared prompt template loader. Reads `.md` files from `prompts/`, caches in-memory, fills `{placeholders}` via `str.format()`. Used by all runtime components.
 
-6. **`skills/leviathan-headlines/`** — Claude Code plugin skill for manual headline crafting and review following LN editorial standards.
+6. **`prompts/`** — External prompt template directory. All LLM prompts extracted from the agent files for dev-time context savings and clean separation. Subdirs: `agent/`, `bot/` (+ `knowledge/` topic files).
+
+7. **`github_client.sh`** — Write-only GitHub client wrapper. Enforces repo allowlist (`~/.claude/.github-repos-allowlist`), rate limits non-operators (default 30/day, override via `RATE_LIMIT_MAX`), adds attribution footer. Supports: `issue create|close|comment|edit`, `pr create|comment`, `repo create|push`, `allowlist add|list`. Token loaded from `~/.claude/.github-token`. New repos auto-added to allowlist under `GITHUB_ORG` (env).
+
+8. **`skills/leviathan-headlines/`** — Claude Code plugin skill for manual headline crafting and review following LN editorial standards.
 
 ## Architecture: ln-agent.py
 
 Single-file Python agent running in a continuous loop (`run_loop`) with a flat 1-hour sleep after each completed cycle. Each cycle has five phases, with Phase 3 running articles in parallel threads:
 
 1. **Read** — Connect to Telegram via Telethon, fetch new messages from `CHANNELS` list using cursor-based pagination (stored in SQLite). Channel usernames are resolved to numeric IDs and cached to avoid flood waits.
-2. **Evaluate** — Batch all messages to the provider layer for newsworthiness scoring and story-level deduplication. Claude CLI (`claude -p - --effort max --allowedTools <whitelist>`) is primary; Codex CLI (`codex exec`) is fallback when Claude errors or hits limits. The model is instructed to use WebSearch/WebFetch/twitter-explorer to verify stories and find primary sources. Output is strict JSON.
+2. **Evaluate** — Batch all messages through `providers.py` for newsworthiness scoring and story-level deduplication. Default order: Codex CLI (`codex exec --dangerously-bypass-approvals-and-sandbox -m gpt-5.5 -c model_reasoning_effort=xhigh`) is primary, Claude CLI (`claude -p - --effort max --allowedTools <whitelist>`) is the fallback (override via `PROVIDER_ORDER`). Each provider has its own circuit breaker; failures in one don't penalize others. The active model is instructed to use WebSearch/WebFetch/twitter-explorer to verify stories and find primary sources. Output is strict JSON.
+
+3. **Dedup gate** — Three layers of duplicate suppression before crafting any headline:
+   - DB URL match (cheap, catches reprints of the same URL)
+   - `was_story_posted()` — word-overlap against our own last-24h posts (catches same story from different sources)
+   - **Bot HQ dedup** — `fetch_bot_hq_recent_headlines()` pulls recent posts from the configured `BOT_HQ_GROUP_ID` directly via the Telegram client, then a Sonnet/tier=classification call decides whether the candidate matches any. Deterministic fetch (no LLM-directed search) makes the check auditable and consistent.
 3. **Post** — For each newsworthy item: check DB + Bot HQ for duplicates, verify freshness, resolve URL + craft headline + write TL;DR in a single Opus call (`resolve_craft_headline_tldr()`), submit via LN API (`/api/v1/news/post`), auto-upvote, add TL;DR comment.
 4. **Vote/Comment** — Fetch recent approved articles from LN API, evaluate quality via the provider layer, vote up/down, write analysis comments on uncommented articles. Also votes on other users' comments (yaps).
 5. **Reply Detection** — Separate pass over last 20 articles we've commented on (regardless of age). Detects unreplied responses to our comments via `walk_replies_and_respond()`, crafts replies with prompt injection defense + sentinel verification. Skips articles already processed in Phase 4.
@@ -33,11 +42,16 @@ Single-file Python agent running in a continuous loop (`run_loop`) with a flat 1
 - **`LNClient`** — LN API client with wallet-based auth (nonce → sign → verify → JWT). Endpoints: `/news/post`, `/news/{id}/vote`, `/news/{id}/post_yap`, `/news/{id}/list_yaps`
 
 ### AI Evaluation Functions
-All AI calls go through `llm_ask()`, a provider wrapper with two tiers:
-- **Creative tier** (Opus, max effort, full tools, soul prompt): headlines, TL;DR, analysis, replies
-- **Classification tier** (Sonnet, low effort, no tools, no soul): votes, freshness, dup checks, reply worthiness
+All AI calls go through `llm_ask()` → `ProviderChain.ask()`. Two semantic tiers expressed via `tier=`:
+- **Creative tier** (default — no `tier=` kwarg): full reasoning, full tool access, soul prompt prepended. Used for headlines, TL;DR, analysis, replies.
+- **Classification tier** (`tier="classification"`): cheap, fast, no tools, no soul. Each provider maps the tier to its own model/effort (Claude→sonnet/low, Codex→same model at low effort). Used for votes, freshness checks, dedup, sentinel, reply worthiness.
 
-`llm_ask()` params: `claude_model`, `claude_effort`, `skip_soul`, `allowed_tools`. Provider order configurable via `PROVIDER_ORDER` env var (default: `claude,codex,opencode`). OpenCode dormant unless `OPENCODE_MODEL` is set. `"__none__"` sentinel = no tools.
+`llm_ask()` params:
+- `tier="classification"` — semantic preset, works across any chain ordering
+- `model` / `effort` / `tools` — explicit per-call overrides, beat the tier preset
+- `skip_soul=True` — omit the soul prepend for non-conversational calls
+
+Provider order is driven by `PROVIDER_ORDER` env (default `codex,claude,opencode`). OpenCode stays dormant unless `OPENCODE_MODEL` is set. The `"__none__"` sentinel disables tool access for Claude (empty string and unset both grant ALL tools by default in Claude CLI).
 
 Key functions:
 - `evaluate_and_deduplicate()` — batch evaluation, returns JSON array
@@ -58,9 +72,10 @@ Key functions:
 - `LNClient`: `threading.RLock` on all session methods. `_refresh_if_stale()` called inside the lock to avoid TOCTOU races (30-min TTL).
 
 ### Circuit Breaker
-- After 3 consecutive Claude CLI failures, Claude is skipped and the provider layer falls back to Codex.
-- Claude `501`/quota/rate-limit style errors mark Claude unavailable for `CLAUDE_LIMIT_COOLDOWN` seconds (default: 6 hours).
-- Failure counts reset at the start of each cycle in `run_agent()`. The quota cooldown does not.
+- Each provider in the chain owns its own `CircuitBreaker` — failures in one don't penalize the others.
+- After 3 consecutive failures, a provider's breaker opens; the chain moves on to the next provider.
+- Claude `501`/quota/rate-limit style errors trigger a longer cooldown via `quota_cooldown` (default: 6 hours, override via `CLAUDE_LIMIT_COOLDOWN`).
+- `_provider_chain.reset_failures()` is called at the start of each `run_agent()` cycle to clear transient failure counts. Quota cooldowns are preserved — those represent real lockouts.
 
 ### Retry & Error Handling
 - Claude CLI calls retry up to 2 times with exponential backoff (5s, 10s) before incrementing the breaker or triggering Codex fallback.

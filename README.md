@@ -2,7 +2,7 @@
 
 White-label news curation agent for [Leviathan News](https://leviathannews.xyz) — a decentralized crypto/DeFi news platform where contributors earn $SQUID tokens. Fork it, set `AGENT_NAME`, and run your own instance.
 
-The agent monitors Telegram news channels, evaluates newsworthiness via Claude CLI (with Codex fallback), crafts headlines, submits articles, votes, comments, and replies — all autonomously in a continuous loop.
+The agent monitors Telegram news channels, evaluates newsworthiness via a provider chain (Codex primary, Claude fallback by default — swappable via `PROVIDER_ORDER`), crafts headlines, submits articles, votes, comments, and replies — all autonomously in a continuous loop.
 
 ## How It Works
 
@@ -25,14 +25,15 @@ Channels      Deduplicate       LN API        Comment          Responses
 
 ## Features
 
-- **Configurable multi-provider LLM**: Set `PROVIDER_ORDER` to choose your provider priority (Claude, Codex, OpenCode). Circuit breaker auto-switches after 3 failures or quota errors
-- **6-layer prompt injection defense**: input sanitization, XML boundary tags, output injection detection, NFKD Unicode normalization, URL validation, independent Sonnet sentinel verification on replies
+- **Provider-agnostic LLM dispatch** (`providers.py`): Codex / Claude / OpenCode interchangeably. `PROVIDER_ORDER` env picks the primary; the rest are fallbacks. Each provider has its own circuit breaker — failures in one don't penalize the others.
+- **Semantic tier abstraction**: caller code says `tier="classification"` for cheap/fast calls; each provider maps that to its own model+effort (Claude→sonnet/low, Codex→same model at low effort). No Claude-specific model names leak into provider-neutral call sites.
+- **6-layer prompt injection defense**: input sanitization, XML boundary tags, output injection detection, NFKD Unicode normalization, URL validation, independent sentinel verification on replies
 - **Wallet-based auth**: EIP-191 signature flow with thread-safe session management (30-min refresh, RLock)
 - **Headline validation**: 10 automated checks (character count, sentence case, passive voice, articles, etc.) via bundled bash validator
-- **Story deduplication**: multi-layer — LLM-powered story matching, local DB URL check, Bot HQ Telegram search, LN API check
+- **Story deduplication**: three layers — local DB URL check, self-dedup word-overlap against own last-24h posts, deterministic Bot HQ fetch + Sonnet semantic match
 - **Anti-AI-detection**: banned phrase filtering to avoid patterns that get content deprioritized
 - **Cursor-based Telegram pagination**: with numeric ID caching to avoid flood waits
-- **Token optimization**: tiered LLM calls — Sonnet/low for classification, Opus/max for creative tasks
+- **Optional async build daemon** (`benthic-builder.py`): operators queue project briefs; Codex builds + pushes them as public GitHub repos under `BUILD_GITHUB_ORG`. Hard-capped, isolated per-task workdirs.
 
 ## Current Limitations
 
@@ -53,9 +54,9 @@ Installed via `pip install -r requirements.txt`:
 
 You need **at least one** LLM provider. Configure the priority via `PROVIDER_ORDER`:
 
-- **[Claude CLI](https://docs.anthropic.com/en/docs/claude-code)** (`claude`) — primary by default. Must be on `$PATH` or set `CLAUDE_BIN`.
-- **[Codex CLI](https://github.com/openai/codex)** (optional) — fallback LLM provider. Auto-detected or set `CODEX_BIN`.
-- **[OpenCode CLI](https://opencode.ai/)** (optional) — alternative provider. Set `OPENCODE_BIN` and `OPENCODE_MODEL` to enable.
+- **[Codex CLI](https://github.com/openai/codex)** (`codex`) — primary by default. Auto-detected or set `CODEX_BIN`. Default model: `gpt-5.5` at `xhigh` reasoning effort.
+- **[Claude CLI](https://docs.anthropic.com/en/docs/claude-code)** (`claude`) — fallback by default. Must be on `$PATH` or set `CLAUDE_BIN`.
+- **[OpenCode CLI](https://opencode.ai/)** (optional) — additional fallback. Set `OPENCODE_BIN` and `OPENCODE_MODEL` to enable.
 - **Telegram API credentials** — `api_id` and `api_hash` from [my.telegram.org](https://my.telegram.org)
 - **Ethereum wallet** — private key for LN API authentication (EIP-191 signing)
 - **Leviathan News account** — wallet must be registered at [leviathannews.xyz](https://leviathannews.xyz)
@@ -115,13 +116,15 @@ See [.env.example](.env.example) for a complete template with `export` lines you
 | `BOT_HQ_GROUP_ID` | **(required)** | Telegram group ID used as ground truth for duplicate detection |
 | `CLAUDE_BIN` | auto-detected | Path to Claude CLI binary |
 | `CODEX_BIN` | auto-detected | Path to Codex CLI binary |
-| `CODEX_MODEL` | `gpt-5.4` | Model for Codex |
+| `CODEX_MODEL` | `gpt-5.5` | Model for Codex |
+| `CODEX_EFFORT` | `xhigh` | Codex reasoning effort: `low` / `medium` / `high` / `xhigh` |
 | `OPENCODE_BIN` | auto-detected | Path to OpenCode CLI binary |
 | `OPENCODE_MODEL` | — (disabled) | OpenCode model (e.g. `anthropic/claude-sonnet-4-5`). Required to enable. |
-| `PROVIDER_ORDER` | `claude,codex,opencode` | Comma-separated provider priority (first available is primary) |
+| `PROVIDER_ORDER` | `codex,claude,opencode` | Comma-separated provider priority (first available is primary) |
 | `CLAUDE_LIMIT_COOLDOWN` | `21600` (6h) | Seconds to skip Claude after quota/rate-limit error |
 | `CHANNELS` | `[]` | JSON array of Telegram channels, e.g. `'["@chan1","@chan2"]'` |
 | `PRIVATE_CHANNELS` | `[]` | JSON array of private channel display names |
+| `HEADLINE_BOT_USER_ID` | `0` (any) | Optional Telegram user ID of the headline bot. When set, Bot HQ dedup filters to messages from that user only. |
 | `CYCLE_INTERVAL` | `3600` (1h) | Seconds between cycles |
 | `INITIAL_LOOKBACK_HOURS` | `1` | Hours to look back on first run |
 | `TELEGRAM_CLIENT_SCRIPT` | `skills/telegram-explorer/scripts/telegram_client.py` | Path to Telegram CLI wrapper |
@@ -234,14 +237,16 @@ The agent runs in a continuous loop — PM2's `autorestart` handles crashes, and
 ## Project Structure
 
 ```
-ln-agent-public/
-├── ln-agent.py              # Main news agent
-├── benthic-bot.py           # Telegram chat bot
+be-benthic/
+├── ln-agent.py              # Automated news agent (Phase 1-5 loop)
+├── benthic-bot.py           # Telegram chat bot (shared brain + memory)
+├── benthic-builder.py       # Optional Codex-powered build daemon
+├── providers.py             # Provider-agnostic LLM dispatch (Claude/Codex/OpenCode + chain)
 ├── prompt_loader.py         # Shared prompt template loader
 ├── github_client.sh         # Write-only GitHub client wrapper
-├── prompts/                 # External prompt templates
-│   ├── agent/               # 14 news agent prompts
-│   └── bot/                 # 10 chat bot prompts + 15 knowledge topics
+├── prompts/                 # External prompt templates with {placeholders}
+│   ├── agent/               # News agent prompts
+│   └── bot/                 # Chat bot prompts + knowledge topics
 ├── scripts/
 │   └── twitter_fetch.py     # No-op stub (replace with your own)
 ├── skills/
@@ -259,13 +264,14 @@ ln-agent-public/
 │       │   └── ethereum-terminology.md
 │       └── scripts/
 │           └── validate-headline.sh
-├── tests/                   # pytest test suite (46 tests)
+├── tests/                   # pytest test suite (includes provider chain unit tests)
 ├── ecosystem.config.js      # PM2 deployment config
 ├── requirements.txt         # Python dependencies
 ├── requirements-dev.txt     # Dev dependencies (pytest)
 ├── .env.example             # Environment variable template
 ├── CLAUDE.md                # Claude Code context (architecture, conventions)
 ├── AGENTS.md                # Agent operational state notes
+├── SOUL.md                  # Psychological-character document loaded into prompts
 └── .claude-plugin/
     └── plugin.json          # Claude plugin metadata
 ```
@@ -318,7 +324,8 @@ python -m pytest tests/ -v
 | `ALLOWED_GROUPS` | No | JSON array of additional group IDs: `'[-100123456789]'` |
 | `OPERATOR_IDS` | No | JSON array of Telegram user IDs: `'[12345678]'` |
 | `AGENT_DIR` | No | Agent directory for operator Bash tool restrictions (default: script directory) |
-| `PROVIDER_ORDER` | No | Comma-separated provider priority (default: `claude,codex,opencode`) |
+| `PROVIDER_ORDER` | No | Comma-separated provider priority (default: `codex,claude,opencode`) |
+| `CODEX_MODEL` / `CODEX_EFFORT` | No | Codex model + reasoning effort (defaults: `gpt-5.5` / `xhigh`) |
 | `OPENCODE_MODEL` | No | OpenCode model to enable it (e.g. `anthropic/claude-sonnet-4-5`) |
 
 ### Running
@@ -351,6 +358,47 @@ pm2 start ecosystem.config.js
 ### Customizing personality
 
 Set `AGENT_NAME` to brand your instance, then customize `prompts/bot/identity.md` for your agent's personality. The identity prompt uses `{agent_name}` placeholders filled at runtime.
+
+## Build Daemon (optional)
+
+`benthic-builder.py` is an opt-in background daemon that consumes a `build_tasks`
+queue from the shared SQLite. Operators (via the chat bot's persistent-memory
+directives) can hand the daemon a project brief; the daemon spawns Codex CLI in
+an isolated workdir, hands it the brief plus a delivery rubric (working code,
+README, .env.example, dependency manifest), and pushes the result as a public
+repo under your configured GitHub org.
+
+Each task is **isolated** (per-task `workdir` under `BUILD_ROOT`, never touches
+the agent's own files), **time-capped** (6h hard wall, real target 30-90 min),
+and **logged** to `BUILD_LOG_ROOT/<id>.log`. On startup the daemon sweeps
+orphaned `running` rows whose PIDs are gone so a crashed task doesn't deadlock
+the queue.
+
+### Configuration
+
+| Variable | Required | Description |
+|----------|----------|-------------|
+| `BUILD_GITHUB_ORG` | **Yes** | GitHub org/user the daemon publishes built repos under |
+| `BUILD_GIT_USER_NAME` | No | git author name on the initial commit (default `Agent Builder`) |
+| `BUILD_GIT_USER_EMAIL` | No | git author email on the initial commit (default `agent@example.com`) |
+| `BUILD_ROOT` | No | Per-task workdir root (default `/tmp/agent-builds`) |
+| `BUILD_LOG_ROOT` | No | Build log directory (default `/tmp/agent-build-logs`) |
+| `BUILD_TIMEOUT` | No | Hard cap per task in seconds (default 21600 = 6h) |
+| `BUILD_POLL_INTERVAL` | No | Seconds between queue polls (default 10) |
+| `CODEX_BIN` / `CODEX_MODEL` / `CODEX_EFFORT` | No | Same vars as the news agent; daemon shares Codex config |
+
+### Running
+
+```bash
+export BUILD_GITHUB_ORG=YourGithubOrg
+export BUILD_GIT_USER_NAME="Agent Builder"
+export BUILD_GIT_USER_EMAIL="agent@example.com"
+python3 benthic-builder.py
+# or alongside the agent + bot via PM2:
+pm2 start ecosystem.config.js
+```
+
+The bot's identity prompt documents the operator-facing CLI (`bin/benthic-build start <repo_name> --notes "..." <<'BRIEF' ... BRIEF`); see `prompts/bot/identity.md` for the full flow.
 
 ## Contributing
 
