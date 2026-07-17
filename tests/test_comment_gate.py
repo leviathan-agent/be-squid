@@ -211,7 +211,7 @@ def test_craft_comment_levity_uses_levity_template(agent, monkeypatch):
     captured = {}
     monkeypatch.setattr(agent, "claude_ask", lambda prompt: captured.setdefault("prompt", prompt) or "joke 🦑")
     agent.craft_comment_levity("Some headline", [], "https://example.com")
-    assert "HARD LIMIT 280 characters" in captured["prompt"]
+    assert "HARD LIMIT 350 characters" in captured["prompt"]
     assert "HARD LIMIT 950 characters" not in captured["prompt"]
 
 
