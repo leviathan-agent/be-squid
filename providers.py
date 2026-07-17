@@ -429,6 +429,10 @@ class ProviderChain:
     def __init__(self, providers: list[Provider]):
         self.providers = providers
         self._by_name = {p.name: p for p in providers}
+        # Set by ask() on every call — see that method's docstring for the
+        # exhausted-vs-empty distinction these exist to expose.
+        self.last_exhausted: bool = False
+        self.last_error: str = ""
 
     @classmethod
     def from_env_order(cls, env_var: str, default: str,
@@ -448,7 +452,23 @@ class ProviderChain:
         return cls(chain)
 
     def ask(self, prompt: str, *, timeout: int = 3600, **kwargs) -> str:
-        """Try each available provider until one returns a non-empty string."""
+        """Try each available provider until one returns a non-empty string.
+
+        Sets `last_exhausted` / `last_error` before returning, for callers that
+        need to alert on a genuinely dead chain rather than one empty response:
+
+        - `last_exhausted = True` means NO provider was even available to try
+          this call — every breaker open and/or every provider quota-cooled
+          (or the chain is empty). That's what "the LLM provider chain is
+          dead" (key/binary missing, quota exhausted) looks like from here.
+        - `last_exhausted = False` on an empty return means at least one
+          provider WAS tried. Per the `Provider` protocol, a provider's `ask()`
+          collapses "subprocess/CLI failed" and "model returned empty output"
+          into the same `""` — this layer can't tell those apart, so an
+          attempted-but-empty call is deliberately NOT treated as chain
+          exhaustion (it's common/expected noise, not evidence of a dead
+          chain).
+        """
         prompt = strip_surrogates(prompt)
         # Surface typo'd tier names at debug so they're easy to spot in dev
         # without flooding production logs. Unknown tiers still fall through
@@ -471,7 +491,21 @@ class ProviderChain:
             attempted = True
             result = p.ask(prompt, timeout=timeout, **kwargs)
             if result:
+                self.last_exhausted = False
+                self.last_error = ""
                 return result
+        self.last_exhausted = not attempted
+        if not attempted:
+            if self.providers:
+                details = ", ".join(
+                    f"{p.name}(cooldown={p.breaker.cooldown_remaining()}s)"
+                    for p in self.providers
+                )
+                self.last_error = f"no provider available: {details}"
+            else:
+                self.last_error = "no providers configured"
+        else:
+            self.last_error = ""
         return ""
 
     def reset_failures(self):

@@ -267,6 +267,57 @@ def test_chain_reset_failures_resets_all():
     assert p2.is_available()
 
 
+# ─── last_exhausted / last_error (operator-alerting signal) ─────────────────
+
+
+def test_chain_last_exhausted_true_when_no_provider_available():
+    """All breakers open/quota-cooled -> last_exhausted True. This is the
+    'chain is dead' case ln-agent.py alerts the operator on."""
+    p = ClaudeProvider(bin="/bin/echo", retries=0)
+    p.breaker.open_cooldown(cooldown=60, reason="quota")
+    chain = ProviderChain([p])
+    result = chain.ask("test", timeout=1)
+    assert result == ""
+    assert chain.last_exhausted is True
+    assert "no provider available" in chain.last_error
+
+
+def test_chain_last_exhausted_false_when_provider_attempted_but_empty():
+    """A provider that WAS available and tried, but returned empty, is NOT
+    exhaustion — that's 'model returned empty/rejected output', which is
+    common/expected noise and deliberately not alerted on."""
+    p = ClaudeProvider(bin="/bin/echo", retries=0)
+    chain = ProviderChain([p])
+    mock_result = type("R", (), {"returncode": 1, "stdout": "", "stderr": "fail"})()
+    with patch("subprocess.run", return_value=mock_result):
+        result = chain.ask("test", timeout=1)
+    assert result == ""
+    assert chain.last_exhausted is False
+    assert chain.last_error == ""
+
+
+def test_chain_last_exhausted_false_and_error_cleared_on_success():
+    p = ClaudeProvider(bin="/bin/echo", retries=0)
+    chain = ProviderChain([p])
+    # Prime a stale exhausted state from a previous call.
+    chain.last_exhausted = True
+    chain.last_error = "stale"
+    mock_result = type("R", (), {"returncode": 0, "stdout": "ok", "stderr": ""})()
+    with patch("subprocess.run", return_value=mock_result):
+        result = chain.ask("test", timeout=1)
+    assert result == "ok"
+    assert chain.last_exhausted is False
+    assert chain.last_error == ""
+
+
+def test_chain_last_exhausted_true_with_empty_provider_list():
+    chain = ProviderChain([])
+    result = chain.ask("test", timeout=1)
+    assert result == ""
+    assert chain.last_exhausted is True
+    assert chain.last_error == "no providers configured"
+
+
 def test_chain_strips_surrogates_before_dispatch():
     """The chain strips unpaired surrogates so downstream providers don't see them."""
     p = ClaudeProvider(bin="/bin/echo", retries=0)

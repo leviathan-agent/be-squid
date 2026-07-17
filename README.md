@@ -1,3 +1,82 @@
+# be-squid 🦑
+
+An autonomous Leviathan News commenting agent — a **fork of
+[be-benthic](https://github.com/leviathan-news/be-benthic)** (MIT) with a
+different persona and a set of safety/operability features layered on top.
+Built and run by DeepSeaSquid.
+
+> **Fork attribution:** All core agent architecture (the Phase 1–5 loop, the
+> provider chain, the LN API client, the SOUL.md functional-emotion skeleton) is
+> be-benthic's work, unchanged in spirit. This fork keeps the MIT license and
+> credits the upstream authors. What's added here is listed below.
+
+## What this fork adds over be-benthic
+
+- **`COMMENT_ONLY`** — run just the comment/reply phases; the Telegram-scan and
+  article-submission phases (and their userbot session requirement) are skipped
+  entirely. Wallet auth is the only credential needed.
+- **`DRY_RUN`** — every write (yap, vote, submission) goes to `dry_run.log` as a
+  JSON line instead of hitting the API. Read-only calls stay live. Calibrate
+  before you ever post.
+- **`VOTING_ENABLED`** (default **off**) — a hard gate on the whole voting path.
+  **Read the warning below before enabling it.**
+- **Sonnet pin via `CLAUDE_BIN`** — a 2-line wrapper (`bin/claude-sonnet.sh`)
+  pins the model with no code patch. Runs on a Claude subscription (no metered
+  API key) if the CLI is logged in.
+- **Operator alerts** (`alerts.py`) — Telegram ping to an operator channel when
+  the provider chain is exhausted or a key is missing, episode-deduped (one
+  alert per failure, one on recovery — never per-cycle spam).
+- **Comment gate** — a cheap classifier routes each article SUBSTANCE / LEVITY /
+  SKIP before any expensive craft call, so the agent picks its shots instead of
+  commenting on everything.
+- **Output hygiene** — rejects model meta-commentary ("this comment is 758
+  characters…") and enforces the 1000-char platform cap before posting.
+- **Anti-template context injection** — each craft call sees the agent's own
+  recent comments and the other comments already on the article, with a rotated
+  structural directive, so the feed doesn't converge on one shape.
+
+## ⚠️ Read before enabling `VOTING_ENABLED` — this cost us a public mistake
+
+The inherited vote classifiers are **unsafe on a Sonnet-tier model**, verified
+on live data:
+
+1. `evaluate_comment_quality` on Sonnet **downvoted a genuinely excellent,
+   well-sourced comment three times out of three** (a precise x402 analysis
+   citing its primary source + arXiv). With no tools, the model can't verify a
+   citation, and the prompt tells it to downvote "misleading" — so it torpedoes
+   exactly the comments a moderator exists to protect.
+2. `batch_evaluate_comments` on Sonnet **false-positives its own task prompt as a
+   prompt-injection attempt** (the prompt contains "injection attempts →
+   DOWNVOTE" and the model decides the task itself is the attack), fails to
+   parse, and falls through to the broken path above.
+
+be-benthic runs these classifiers on a **strong model** (Codex gpt-5.5 / xhigh by
+default, Claude fallback) — the tier is load-bearing, and it's why its moderation
+works. **If you enable voting, pin the classification tier to a strong model and
+re-validate against known-good and known-bad comment sets in `DRY_RUN` first.**
+Batch evaluation is one call per 20 articles, so quality here is nearly free.
+
+### Notes for a moderation-first build
+
+The persona of a *commenter* lives in the craft prompts. The persona of a
+*moderator* lives in the **evaluation prompts** — `evaluate_comment_quality.md`
+and friends are where "what earns an up, a down, or silence" is defined; that's
+where your standards become the product. Keep SOUL.md's calm-over-desperate
+skeleton whatever else you change — it's what keeps a judge honest under
+argument. Suggested config: `COMMENT_ONLY=1`, `VOTING_ENABLED=1`, a strong
+classification tier, `DRY_RUN=1` until the would-vote log separates good from bad
+cleanly. Abstain by default — a wrong downvote costs more than a missed upvote
+earns.
+
+## Config
+
+See `.env.squid.example` for the full annotated configuration. Copy it to `.env`
+and fill in a wallet key path.
+
+---
+
+*(be-benthic's original README follows below.)*
+
 # LN Agent
 
 White-label news curation agent for [Leviathan News](https://leviathannews.xyz) — a decentralized crypto/DeFi news platform where contributors earn $SQUID tokens. Fork it, set `AGENT_NAME`, and run your own instance.

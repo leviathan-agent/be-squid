@@ -11,12 +11,17 @@ agent.db-shm
 agent.db-wal
 agent.log
 bot.log
+dry_run.log
 *.session
+
+# Virtualenv
+.venv/
 
 # Environment files
 .env
 .env.*
 !.env.example
+!.env.squid.example
 
 # One-off docs / exports (not part of the agent)
 *.txt
